@@ -216,7 +216,8 @@ const MCP_SESSION_VERSION = process.env.MCP_SESSION_VERSION || '1';
 
 const activeContext = {
   diagramId: DEFAULT_DIAGRAM_ID,
-  sessionId: `mcp-${generateId()}`,
+  // Use persistent session ID so elements created in one MCP call can be updated in subsequent calls
+  sessionId: 'mcp-persistent-session',
   sessionName: MCP_SESSION_NAME
 };
 
@@ -253,6 +254,15 @@ function activateDiagram(diagramId: string): void {
 }
 
 initializeMcpSession();
+
+// Restore active diagram from persistent session if one exists
+const persistedSession = diagramStore.getSession('mcp-persistent-session');
+if (persistedSession?.activeDiagramId) {
+  activeContext.diagramId = persistedSession.activeDiagramId;
+  applySceneState(persistedSession.activeDiagramId);
+  logger.info(`Restored active diagram from session: ${persistedSession.activeDiagramId}`);
+}
+
 const initialSceneState = diagramStore.getSceneState(activeContext.diagramId);
 if (!initialSceneState) {
   persistSceneState(activeContext.diagramId);
