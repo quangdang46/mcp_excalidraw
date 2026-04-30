@@ -141,7 +141,7 @@ PORT=3000 npm run canvas
 ### Creating a new diagram
 When user asks to create a diagram (e.g., "vẽ sơ đồ CI/CD", "create a flowchart"):
 ```
-1. create_diagram(name: "CI/CD Pipeline", tags: ["ci-cd", "pipeline"])
+1. create_diagram(name: "CI/CD Pipeline")
 2. batch_create_elements with all elements
 3. set_viewport(scrollToContent: true)
 ```
@@ -155,7 +155,7 @@ When user wants to continue on an existing diagram:
 
 ### Listing all diagrams
 ```
-list_diagrams → returns all diagrams with names and tags
+list_diagrams → returns all diagrams with names
 ```
 
 ---
@@ -164,7 +164,7 @@ list_diagrams → returns all diagrams with names and tags
 
 **IMPORTANT**: Always create a named diagram FIRST, before creating any elements.
 
-1. `create_diagram(name: "Descriptive Name", tags: ["category"])`
+1. `create_diagram(name: "Descriptive Name")`
 2. `read_diagram_guide` for design best practices
 3. Plan coordinates on grid — map tiers and x-positions
 4. `batch_create_elements` — shapes + arrows in one call

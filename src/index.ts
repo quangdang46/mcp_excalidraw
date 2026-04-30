@@ -1809,14 +1809,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case 'create_diagram': {
         const params = z.object({
           name: z.string(),
-          tags: z.array(z.string()).optional(),
           description: z.string().optional()
         }).parse(args || {});
 
         const diagram = diagramStore.ensureDiagram({
           id: generateId(),
           name: params.name,
-          tags: params.tags || [],
           description: params.description || null,
         });
         activateDiagram(diagram.id);
