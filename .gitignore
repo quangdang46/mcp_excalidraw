@@ -26,3 +26,7 @@ docs/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# SQLite databases
+.excalidraw_mcp/
+.data/

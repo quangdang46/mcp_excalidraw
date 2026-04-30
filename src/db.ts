@@ -21,7 +21,8 @@ import {
   validateBatchOperation,
 } from './types.js';
 
-const DATA_DIR = path.join(process.cwd(), '.excalidraw_mcp');
+// Hardcode absolute path to ensure both MCP and Express servers use the same DB
+const DATA_DIR = '/data/projects/mcp_excalidraw/.excalidraw_mcp';
 const DB_PATH = process.env.EXCALIDRAW_DB_PATH || path.join(DATA_DIR, 'excalidraw.sqlite');
 
 function ensureDataDir(): void {
