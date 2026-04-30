@@ -188,6 +188,22 @@ batch_create_elements
 
 ---
 
+## Workflow: Edit Existing Diagrams
+
+**CRITICAL**: Never delete and recreate elements. Always update in place.
+
+```bash
+# Update element position/size via REST API
+curl -X PUT http://127.0.0.1:3000/api/elements/:id -d '{"x": 100, "y": 200}'
+```
+
+When user asks to "rearrange", "move", "adjust position" on an existing diagram:
+1. NEVER call clear_canvas or delete_element
+2. Use update_element for position changes
+3. Use batch_create_elements ONLY for NEW elements
+
+---
+
 ## Workflow: Mermaid Conversion
 
 ```
