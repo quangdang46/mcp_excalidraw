@@ -167,7 +167,8 @@ async function deleteElementOnCanvas(elementId: string): Promise<any> {
 // Helper to sync batch creation to canvas
 async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<ServerElement[] | null> {
   const result = await syncToCanvas('batch_create', elementsData);
-  return result?.elements || elementsData;
+  if (!result) return null;
+  return result.elements || null;
 }
 
 // Helper to fetch element from canvas
