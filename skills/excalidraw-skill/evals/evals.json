@@ -3,20 +3,62 @@
   "evals": [
     {
       "id": 0,
-      "prompt": "Draw a CI/CD pipeline architecture diagram on the Excalidraw canvas with these components: GitHub (source), GitHub Actions (CI), Docker Registry (artifact store), and Kubernetes Cluster (deployment target). Use arrows to show the flow from left to right. Make sure labels fit inside each box and nothing overlaps.",
-      "expected_output": "A clean diagram with 4 labeled boxes, left-to-right flow arrows connecting them, no overlapping elements, and all text fully visible inside shapes.",
+      "prompt": "Create a CI/CD pipeline diagram with 4 components: GitHub → GitHub Actions → Docker Registry → Kubernetes Cluster. Use arrows to show flow left-to-right. Add labels on arrows showing: 'push', 'build', 'push', 'deploy'. After creating, take a screenshot and verify all text fits inside boxes with no overlaps.",
+      "expected_output": "Clean diagram with 4 labeled boxes, left-to-right flow arrows, visible labels on arrows, no overlapping elements.",
       "files": []
     },
     {
       "id": 1,
-      "prompt": "Convert this Mermaid flowchart to an Excalidraw diagram:\n```\ngraph TD\n  A[User] -->|HTTP Request| B[Load Balancer]\n  B --> C[Web Server 1]\n  B --> D[Web Server 2]\n  C --> E[(Database)]\n  D --> E\n```\nAfter converting, take a screenshot and verify the layout looks clean.",
-      "expected_output": "A valid Excalidraw diagram with all 5 nodes and arrows matching the Mermaid structure, verified with a screenshot.",
+      "prompt": "Convert this Mermaid diagram to Excalidraw using create_from_mermaid:\n```\ngraph TD\n  A[User] -->|HTTP| B[Load Balancer]\n  B --> C[Web Server 1]\n  B --> D[Web Server 2]\n  C --> E[(Database)]\n  D --> E\n```\nTake a screenshot and verify the layout. If arrows cross or elements overlap, use update_element to reposition.",
+      "expected_output": "Excalidraw diagram with 5 nodes and arrows matching Mermaid structure, verified with screenshot showing clean layout.",
       "files": []
     },
     {
       "id": 2,
-      "prompt": "Create a simple diagram on the Excalidraw canvas with two rectangles: 'Auth Service' and 'User DB', connected by an arrow labeled 'queries'. Then refine it: add a third box 'Redis Cache' positioned between the two services, connect Auth Service to Redis Cache with a 'cache hit' arrow. Verify visually that all labels are visible and no arrows cross awkwardly.",
-      "expected_output": "A 3-element diagram with Auth Service → Redis Cache → (and both connected back to) User DB, with clean arrows, visible labels, and a screenshot confirming the final state.",
+      "prompt": "Create 3 boxes: 'Auth Service', 'Redis Cache', 'User DB'. Connect them: Auth → Redis (label: 'cache hit/miss'), Auth → User DB (label: 'query'). Use duplicate_elements to clone Auth Service and position it below. Take screenshot and verify all labels visible.",
+      "expected_output": "3-element diagram (Auth Service, Redis Cache, User DB) with arrows and labels, plus cloned Auth Service. Screenshot confirms no text truncation or overlaps.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Create a simple architecture diagram with: API Gateway (top center), 3 microservices below it (User Svc, Order Svc, Payment Svc), and a Database at bottom. Use group_elements to group the 3 microservices together. Take screenshot showing the group boundary.",
+      "expected_output": "Architecture diagram with grouped microservices, clear visual hierarchy, screenshot confirms grouping visible.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Create several elements then: (1) snapshot_scene with name 'before-test', (2) clear_canvas, (3) verify canvas is empty with describe_scene, (4) restore_snapshot with name 'before-test', (5) verify elements are back with describe_scene.",
+      "expected_output": "Round-trip: elements created, snapshot saved, canvas cleared (empty describe_scene confirms), snapshot restored (describe_scene shows original elements).",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Create 5 different element types: rectangle, ellipse, diamond, text, and arrow. Use query_elements to find all elements of type 'rectangle'. Use get_element to get details of one specific element. Lock the rectangle with lock_elements, then try to update it - verify it fails or is rejected. Unlock and verify update works.",
+      "expected_output": "Can query by type, get single element, lock prevents updates, unlock allows updates. Confirmed via screenshot or error messages.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Simulate two sessions working on the same canvas: (1) Create some elements as Session A, (2) query_elements to see current state, (3) simulate Session B by calling batch_create_elements, (4) verify describe_scene shows both Session A and Session B elements visible. Take screenshot showing combined state.",
+      "expected_output": "Multi-session diagram with elements from both sessions visible, no conflicts, screenshot confirms all elements present.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Test concurrent modification: (1) Create 10 elements, (2) Use duplicate_elements to clone all 10 with offset, (3) Verify query_elements returns 20 elements, (4) Take screenshot confirming both sets are visible without overlap.",
+      "expected_output": "20 elements total (original 10 + 10 cloned), screenshot confirms clean duplication without overlap.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Test restore across sessions: (1) Create elements, (2) snapshot_scene with name 'session-checkpoint', (3) clear_canvas, (4) restore_snapshot, (5) query_elements confirms original elements restored. Use export_scene to save the restored state, then import_scene to verify round-trip integrity.",
+      "expected_output": "Snapshot/restore works across clear operation. Export/import produces identical element set. query_elements confirms element count matches original.",
+      "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "Test presence awareness: (1) Create a diagram with multiple element types, (2) Use get_resource to check session/diagram state, (3) Use query_elements with different filters (rectangle, arrow, text) to verify filtering works correctly, (4) Take screenshot and verify only expected elements are highlighted/visible based on filter results.",
+      "expected_output": "get_resource returns session info, query_elements correctly filters by type, screenshot shows filtered results accurately.",
       "files": []
     }
   ]

@@ -167,6 +167,30 @@ export interface SyncResponse extends ApiResponse {
   afterCount: number;
 }
 
+export interface VersionedSyncRequest {
+  sessionId: string;
+  baseVersion: number;
+  elements: ServerElement[];
+  timestamp: string;
+}
+
+export interface VersionedSyncResponse extends ApiResponse {
+  diagramId: string;
+  sessionId: string;
+  serverVersion: number;
+  applied: boolean;
+  count: number;
+  syncedAt: string;
+  conflicts?: boolean;
+  elements?: ServerElement[];
+}
+
+export interface InitialSceneState {
+  diagramId: string;
+  serverVersion: number;
+  sessionId?: string;
+}
+
 // WebSocket message types
 export interface WebSocketMessage {
   type: WebSocketMessageType;
@@ -186,7 +210,8 @@ export type WebSocketMessageType =
   | 'export_image_request'
   | 'set_viewport'
   | 'files_added'
-  | 'file_deleted';
+  | 'file_deleted'
+  | 'diagram_updated';
 
 export interface InitialElementsMessage extends WebSocketMessage {
   type: 'initial_elements';
@@ -275,6 +300,13 @@ export interface SetViewportMessage extends WebSocketMessage {
   offsetY?: number;
 }
 
+export interface DiagramUpdatedMessage extends WebSocketMessage {
+  type: 'diagram_updated';
+  diagramId: string;
+  diagramName: string;
+  action: string;
+}
+
 // Snapshot types
 export interface Snapshot {
   name: string;
@@ -282,11 +314,98 @@ export interface Snapshot {
   createdAt: string;
 }
 
-// In-memory storage for Excalidraw elements
-export const elements = new Map<string, ServerElement>();
+export interface DiagramRecord {
+  id: string;
+  name: string;
+  tags: string[];
+  description?: string | null;
+  thumbnail?: string | null;
+  archivedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
 
-// In-memory storage for snapshots
-export const snapshots = new Map<string, Snapshot>();
+export type SessionStatus = 'active' | 'idle' | 'stale' | 'closed';
+
+export interface SessionRecord {
+  id: string;
+  activeDiagramId: string;
+  status: SessionStatus;
+  lastHeartbeatAt: string;
+  lastSyncAt?: string | null;
+  lastAckVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Operation lock for temporary blocking of destructive actions
+export interface OperationLock {
+  operationType: 'clear' | 'bulk_delete' | 'restore' | 'import';
+  lockedBySessionId: string;
+  lockedAt: string;
+  expiresAt: string;
+}
+
+// Session presence info for a diagram
+export interface DiagramPresence {
+  diagramId: string;
+  activeSessions: SessionRecord[];
+  staleCount: number;
+  conflictingCount: number; // sessions that have unacknowledged changes
+}
+
+export type SyncEventType =
+  | 'element_created'
+  | 'element_updated'
+  | 'element_deleted'
+  | 'elements_replaced'
+  | 'snapshot_created'
+  | 'snapshot_restored'
+  | 'files_updated'
+  | 'canvas_cleared';
+
+export interface SyncEventRecord {
+  id: number;
+  diagramId: string;
+  sessionId?: string | null;
+  eventType: SyncEventType;
+  elementId?: string | null;
+  payload?: Record<string, any> | null;
+  previousPayload?: Record<string, any> | null;
+  createdAt: string;
+}
+
+export interface DiagramSnapshotRecord extends Snapshot {
+  diagramId: string;
+}
+
+export interface DiagramSummary extends DiagramRecord {
+  elementCount: number;
+  snapshotCount: number;
+  sessionCount: number;
+}
+
+export interface SceneStateRecord {
+  diagramId: string;
+  theme: string;
+  viewport: { x: number; y: number; zoom: number };
+  selectedElementIds: string[];
+  groups: Record<string, string[]>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DiagramStateSnapshot {
+  diagram: DiagramRecord;
+  elements: ServerElement[];
+  files: ExcalidrawFile[];
+  snapshots: DiagramSnapshotRecord[];
+  sessions: SessionRecord[];
+  sceneState?: SceneStateRecord | null;
+}
+
+export const DEFAULT_DIAGRAM_ID = 'default';
+export const DEFAULT_DIAGRAM_NAME = 'Untitled Diagram';
 
 // In-memory file storage for image elements (Excalidraw BinaryFiles)
 export interface ExcalidrawFile {
@@ -295,7 +414,6 @@ export interface ExcalidrawFile {
   mimeType: string;
   created: number;
 }
-export const files = new Map<string, ExcalidrawFile>();
 
 // Validation function for Excalidraw elements
 export function validateElement(element: Partial<ServerElement>): element is ServerElement {
@@ -335,4 +453,156 @@ export function normalizeFontFamily(fontFamily: string | number | undefined): nu
     '1': 1, '2': 2, '3': 3, '5': 5, '6': 6, '7': 7, '8': 8,
   };
   return map[fontFamily.toLowerCase()];
+}
+
+// Validation limits for persistence layer
+export const VALIDATION_LIMITS = {
+  MAX_ELEMENT_SIZE_BYTES: 500_000,     // 500KB per element
+  MAX_ELEMENTS_PER_DIAGRAM: 100_000,  // 100k elements per diagram
+  MAX_ELEMENTS_PER_BATCH: 10_000,    // 10k elements per batch operation
+  MAX_PAYLOAD_SIZE_BYTES: 50_000_000, // 50MB total payload
+  MAX_TEXT_LENGTH: 100_000,           // 100k chars for text elements
+  MAX_POINTS_PER_ELEMENT: 10_000,     // 10k points for freedraw/arrow/line
+  MAX_FILES_PER_DIAGRAM: 1_000,       // 1k files per diagram
+  MAX_FILE_SIZE_BYTES: 20_000_000,    // 20MB per file
+  MAX_SNAPSHOT_NAME_LENGTH: 255,     // 255 chars for snapshot names
+  MAX_TAG_LENGTH: 50,                // 50 chars per tag
+  MAX_TAGS_PER_DIAGRAM: 20,           // 20 tags per diagram
+  MAX_DESCRIPTION_LENGTH: 1000,       // 1k chars for description
+  MAX_SESSION_ID_LENGTH: 100,         // 100 chars for session IDs
+  MAX_DIAGRAM_NAME_LENGTH: 255,       // 255 chars for diagram names
+} as const;
+
+// Schema hardening: validate element against known limits
+export interface ValidationResult {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export function validateElementLimits(element: Partial<ServerElement>): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Check text length
+  if (element.type === 'text') {
+    const text = (element as ExcalidrawTextElement).text;
+    if (text && text.length > VALIDATION_LIMITS.MAX_TEXT_LENGTH) {
+      errors.push(`Text content exceeds ${VALIDATION_LIMITS.MAX_TEXT_LENGTH} characters`);
+    }
+  }
+
+  // Check points count for path elements
+  if (element.type === 'arrow' || element.type === 'line' || element.type === 'freedraw') {
+    const points = (element as ExcalidrawArrowElement).points;
+    if (points && points.length > VALIDATION_LIMITS.MAX_POINTS_PER_ELEMENT) {
+      errors.push(`Element has ${points.length} points, maximum is ${VALIDATION_LIMITS.MAX_POINTS_PER_ELEMENT}`);
+    }
+  }
+
+  // Check dimensions
+  if (element.width !== undefined && element.width > 100_000) {
+    warnings.push(`Element width ${element.width} is unusually large`);
+  }
+  if (element.height !== undefined && element.height > 100_000) {
+    warnings.push(`Element height ${element.height} is unusually large`);
+  }
+
+  // Check opacity
+  if (element.opacity !== undefined && (element.opacity < 0 || element.opacity > 100)) {
+    errors.push(`Opacity must be between 0 and 100, got ${element.opacity}`);
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+// Validate payload size
+export function validatePayloadSize(data: unknown, maxBytes: number = VALIDATION_LIMITS.MAX_PAYLOAD_SIZE_BYTES): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  try {
+    const jsonStr = JSON.stringify(data);
+    if (jsonStr.length > maxBytes) {
+      errors.push(`Payload size ${jsonStr.length} bytes exceeds limit of ${maxBytes} bytes`);
+    }
+  } catch {
+    errors.push('Payload is not serializable to JSON');
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+// Validate batch operation
+export function validateBatchOperation(elements: ServerElement[]): ValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (elements.length > VALIDATION_LIMITS.MAX_ELEMENTS_PER_BATCH) {
+    errors.push(`Batch size ${elements.length} exceeds limit of ${VALIDATION_LIMITS.MAX_ELEMENTS_PER_BATCH}`);
+  }
+
+  // Check total size
+  try {
+    const totalSize = elements.reduce((sum, el) => {
+      return sum + JSON.stringify(el).length;
+    }, 0);
+    if (totalSize > VALIDATION_LIMITS.MAX_PAYLOAD_SIZE_BYTES) {
+      errors.push(`Total batch size ${totalSize} bytes exceeds limit of ${VALIDATION_LIMITS.MAX_PAYLOAD_SIZE_BYTES} bytes`);
+    }
+  } catch {
+    errors.push('Cannot calculate batch size');
+  }
+
+  // Warn on potentially large diagrams
+  if (elements.length > 5000) {
+    warnings.push(`Large diagram with ${elements.length} elements may impact performance`);
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+// Observability metrics types
+export interface SyncMetrics {
+  operationType: 'create' | 'update' | 'delete' | 'replace' | 'sync';
+  diagramId: string;
+  sessionId?: string;
+  elementCount: number;
+  durationMs: number;
+  success: boolean;
+  error?: string;
+  timestamp: string;
+}
+
+export interface PerformanceMetrics {
+  diagramId: string;
+  elementCount: number;
+  operationType: string;
+  durationMs: number;
+  timestamp: string;
+}
+
+export interface HealthMetrics {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  websocketClients: number;
+  activeSessions: number;
+  elementCount: number;
+  memoryUsageMb: number;
+  uptimeSeconds: number;
+  issues: string[];
+}
+
+// Legacy global canvas state migration types
+export interface LegacyCanvasState {
+  elements: ServerElement[];
+  version: number;
+  lastModified: string;
+}
+
+export interface MigrationResult {
+  success: boolean;
+  diagramsMigrated: number;
+  elementsMigrated: number;
+  errors: string[];
+  warnings: string[];
 }

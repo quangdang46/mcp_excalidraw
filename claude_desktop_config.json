@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "mcp_excalidraw": {
-      "command": "npx",
-      "args": ["-y", "excalidraw-mcp"]
+      "command": "node",
+      "args": ["/data/projects/mcp_excalidraw/dist/index.js"]
     }
   }
 }

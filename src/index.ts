@@ -26,8 +26,11 @@ import {
   ServerElement,
   ExcalidrawElementType,
   validateElement,
-  normalizeFontFamily
+  normalizeFontFamily,
+  DEFAULT_DIAGRAM_ID,
+  DiagramStateSnapshot
 } from './types.js';
+import { diagramStore } from './db.js';
 import fetch from 'node-fetch';
 
 // Load environment variables
@@ -74,40 +77,46 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
     return null;
   }
 
+  const sessionId = activeContext.sessionId;
+
   try {
     let url: string;
     let options: any;
-    
+
     switch (operation) {
       case 'create':
-        url = `${EXPRESS_SERVER_URL}/api/elements`;
+        url = withDiagramId('/api/elements');
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data)
+          body: JSON.stringify({ ...data, sessionId })
         };
         break;
-        
+
       case 'update':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
+        url = withDiagramId(`/api/elements/${data.id}`);
         options = {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data)
+          body: JSON.stringify({ ...data, sessionId })
         };
         break;
-        
+
       case 'delete':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
-        options = { method: 'DELETE' };
+        url = withDiagramId(`/api/elements/${data.id}`);
+        options = {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId })
+        };
         break;
-        
+
       case 'batch_create':
-        url = `${EXPRESS_SERVER_URL}/api/elements/batch`;
+        url = withDiagramId('/api/elements/batch');
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ elements: data })
+          body: JSON.stringify({ elements: data, sessionId })
         };
         break;
         
@@ -169,7 +178,11 @@ async function getElementFromCanvas(elementId: string): Promise<ServerElement | 
   }
 
   try {
-    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`);
+    const response = await fetch(withDiagramId(`/api/elements/${elementId}`), {
+      headers: {
+        'x-session-id': activeContext.sessionId,
+      },
+    });
     if (!response.ok) {
       logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
       return null;
@@ -196,6 +209,60 @@ const sceneState: SceneState = {
   selectedElements: new Set(),
   groups: new Map()
 };
+
+// MCP session configuration - can be overridden via environment
+const MCP_SESSION_NAME = process.env.MCP_SESSION_NAME || 'excalidraw-mcp';
+const MCP_SESSION_VERSION = process.env.MCP_SESSION_VERSION || '1';
+
+const activeContext = {
+  diagramId: DEFAULT_DIAGRAM_ID,
+  sessionId: `mcp-${generateId()}`,
+  sessionName: MCP_SESSION_NAME
+};
+
+// MCP does NOT auto-create a diagram on init
+// Diagrams must be explicitly created via create_diagram tool
+// or user selects from existing diagrams via list_diagrams tool
+const initializeMcpSession = (): void => {
+  logger.info(`MCP session initialized: ${activeContext.sessionName} (session: ${activeContext.sessionId})`);
+  logger.info(`Default diagram: ${DEFAULT_DIAGRAM_ID}. Use create_diagram to create a named diagram.`);
+};
+
+function persistSceneState(diagramId = activeContext.diagramId): void {
+  diagramStore.upsertSceneState({
+    diagramId,
+    theme: sceneState.theme,
+    viewport: sceneState.viewport,
+    selectedElementIds: Array.from(sceneState.selectedElements),
+    groups: Object.fromEntries(sceneState.groups.entries())
+  });
+}
+
+function applySceneState(diagramId: string): void {
+  const persisted = diagramStore.getSceneState(diagramId);
+  sceneState.theme = persisted?.theme || 'light';
+  sceneState.viewport = persisted?.viewport || { x: 0, y: 0, zoom: 1 };
+  sceneState.selectedElements = new Set(persisted?.selectedElementIds || []);
+  sceneState.groups = new Map(Object.entries(persisted?.groups || {}).map(([groupId, elementIds]) => [groupId, [...elementIds]]));
+}
+
+function activateDiagram(diagramId: string): void {
+  activeContext.diagramId = diagramId;
+  diagramStore.upsertSession({ id: activeContext.sessionId, activeDiagramId: diagramId, status: 'active' });
+  applySceneState(diagramId);
+}
+
+initializeMcpSession();
+const initialSceneState = diagramStore.getSceneState(activeContext.diagramId);
+if (!initialSceneState) {
+  persistSceneState(activeContext.diagramId);
+}
+
+function withDiagramId(pathname: string, diagramId = activeContext.diagramId): string {
+  const url = new URL(pathname, `${EXPRESS_SERVER_URL}/`);
+  url.searchParams.set('diagramId', diagramId);
+  return url.toString();
+}
 
 // Points schema: accept both {x, y} objects and [x, y] tuples
 const PointObjectSchema = z.object({ x: z.number(), y: z.number() });
@@ -373,7 +440,7 @@ const DIAGRAM_DESIGN_GUIDE = `# Excalidraw Diagram Design Guide
 const tools: Tool[] = [
   {
     name: 'create_element',
-    description: 'Create a new Excalidraw element. For arrows, use startElementId/endElementId to bind to shapes (auto-routes to edges).',
+    description: 'IMPORTANT: Before creating elements, you MUST call create_diagram(name: "Descriptive Name") first to create a named diagram. Create a new Excalidraw element. For arrows, use startElementId/endElementId to bind to shapes (auto-routes to edges).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -609,7 +676,7 @@ const tools: Tool[] = [
   },
   {
     name: 'batch_create_elements',
-    description: 'Create multiple Excalidraw elements at once. For arrows, use startElementId/endElementId to bind arrows to shapes — Excalidraw auto-routes to element edges. Assign custom id to shapes so arrows can reference them.',
+    description: 'IMPORTANT: Before creating elements, you MUST call create_diagram(name: "Descriptive Name") first to create a named diagram. Then use this to create multiple Excalidraw elements. For arrows, use startElementId/endElementId to bind arrows to shapes — Excalidraw auto-routes to element edges. Assign custom id to shapes so arrows can reference them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -721,6 +788,10 @@ const tools: Tool[] = [
         background: {
           type: 'boolean',
           description: 'Include background in export (default: true)'
+        },
+        diagramId: {
+          type: 'string',
+          description: 'Optional diagram ID to export instead of the active diagram'
         }
       },
       required: ['format']
@@ -752,6 +823,10 @@ const tools: Tool[] = [
         name: {
           type: 'string',
           description: 'Name for this snapshot'
+        },
+        diagramId: {
+          type: 'string',
+          description: 'Optional diagram ID to snapshot instead of the active diagram'
         }
       },
       required: ['name']
@@ -766,6 +841,10 @@ const tools: Tool[] = [
         name: {
           type: 'string',
           description: 'Name of the snapshot to restore'
+        },
+        diagramId: {
+          type: 'string',
+          description: 'Optional diagram ID to restore into instead of the active diagram'
         }
       },
       required: ['name']
@@ -788,6 +867,10 @@ const tools: Tool[] = [
         background: {
           type: 'boolean',
           description: 'Include background in screenshot (default: true)'
+        },
+        diagramId: {
+          type: 'string',
+          description: 'Optional diagram ID to capture instead of the active diagram'
         }
       }
     }
@@ -836,6 +919,220 @@ const tools: Tool[] = [
         }
       }
     }
+  },
+  {
+    name: 'list_diagrams',
+    description: 'List all diagrams in the store',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'server_info',
+    description: 'Get MCP server version and status. Use this to verify which server version Claude Code is connected to.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'create_diagram',
+    description: 'Create a new named diagram',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Diagram name' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags' },
+        description: { type: 'string', description: 'Optional description' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'get_diagram',
+    description: 'Get diagram metadata by ID',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID (defaults to active diagram)' }
+      }
+    }
+  },
+  {
+    name: 'update_diagram',
+    description: 'Update diagram metadata (name, tags, description, archive status)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID' },
+        name: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        description: { type: 'string' },
+        archived: { type: 'boolean', description: 'Set to true to archive, false to unarchive' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'get_diagram_state',
+    description: 'Get full diagram state including elements, files, snapshots, and sessions',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID (defaults to active diagram)' }
+      }
+    }
+  },
+  {
+    name: 'get_active_diagram',
+    description: 'Get the active diagram for the current MCP session',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'load_diagram',
+    description: 'Load a persisted diagram into the current MCP session context',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID to load' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'set_active_diagram',
+    description: 'Switch the active session to another diagram',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID to activate' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'duplicate_diagram',
+    description: 'Duplicate a diagram and optionally rename the copy',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Source diagram ID (defaults to active diagram)' },
+        name: { type: 'string', description: 'Optional name for the duplicate' }
+      }
+    }
+  },
+  {
+    name: 'delete_diagram',
+    description: 'Delete a diagram by ID',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID to delete' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'list_diagram_events',
+    description: 'List recent sync/mutation events for a diagram (history)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID (defaults to active diagram)' },
+        limit: { type: 'number', description: 'Max events to return (default 50)' }
+      }
+    }
+  },
+  {
+    name: 'describe_scene',
+    description: 'Get an AI-readable description of the current canvas: element types, positions, connections, labels, spatial layout, and bounding box. Use this to understand what is on the canvas before making changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID (defaults to active diagram)' }
+      }
+    }
+  },
+  {
+    name: 'search_diagrams',
+    description: 'Search diagrams by name, description, or tags',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query for name/description' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Filter by tags (any match)' }
+      }
+    }
+  },
+  {
+    name: 'list_recent_diagrams',
+    description: 'List recently updated diagrams',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max diagrams to return (default 10)' }
+      }
+    }
+  },
+  {
+    name: 'archive_diagram',
+    description: 'Archive a diagram (soft delete)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID to archive' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'unarchive_diagram',
+    description: 'Unarchive a diagram',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID to unarchive' }
+      },
+      required: ['diagramId']
+    }
+  },
+  {
+    name: 'export_diagram',
+    description: 'Export entire diagram state for backup or transfer',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID (defaults to active diagram)' }
+      }
+    }
+  },
+  {
+    name: 'import_diagram',
+    description: 'Import a previously exported diagram state',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        data: { type: 'string', description: 'JSON string from export_diagram' },
+        targetId: { type: 'string', description: 'Optional target diagram ID' }
+      },
+      required: ['data']
+    }
+  },
+  {
+    name: 'set_thumbnail',
+    description: 'Set thumbnail preview for a diagram',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        diagramId: { type: 'string', description: 'Diagram ID' },
+        thumbnail: { type: 'string', description: 'Base64 encoded image data' }
+      },
+      required: ['diagramId', 'thumbnail']
+    }
   }
 ];
 
@@ -882,7 +1179,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
     switch (name) {
       case 'create_element': {
         const params = ElementSchema.parse(args);
-        logger.info('Creating element via MCP', { type: params.type });
+        
+        // Enforce diagram-first workflow
+        const currentDiagram = diagramStore.getDiagram(activeContext.diagramId);
+        if (!currentDiagram || activeContext.diagramId === DEFAULT_DIAGRAM_ID || currentDiagram.name === 'Untitled Diagram') {
+          throw new Error('No named diagram created. You MUST call create_diagram(name: "Descriptive Name") before creating elements.');
+        }
+        
+        logger.info('Creating element via MCP', { type: params.type, diagram: currentDiagram.name });
 
         const { startElementId, endElementId, id: customId, ...elementProps } = params;
         const id = customId || generateId();
@@ -1053,7 +1357,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           case 'elements':
             try {
               // Get elements from HTTP server
-              const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
+              const response = await fetch(withDiagramId('/api/elements'));
               if (!response.ok) {
                 throw new Error(`HTTP server error: ${response.status} ${response.statusText}`);
               }
@@ -1356,14 +1660,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         });
 
         try {
-          // Send the Mermaid diagram to the frontend via the API
-          // The frontend will use mermaid-to-excalidraw to convert it
-          const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/from-mermaid`, {
+          const response = await fetch(withDiagramId('/api/elements/from-mermaid'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               mermaidDiagram: params.mermaidDiagram,
-              config: params.config
+              config: params.config,
+              sessionId: activeContext.sessionId
             })
           });
 
@@ -1390,7 +1693,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       
       case 'batch_create_elements': {
         const params = z.object({ elements: z.array(ElementSchema) }).parse(args);
-        logger.info('Batch creating elements via MCP', { count: params.elements.length });
+        
+        // Enforce diagram-first workflow: reject if using default/unnamed diagram
+        const currentDiagram = diagramStore.getDiagram(activeContext.diagramId);
+        if (!currentDiagram || activeContext.diagramId === DEFAULT_DIAGRAM_ID || currentDiagram.name === 'Untitled Diagram') {
+          throw new Error('No named diagram created. You MUST call create_diagram(name: "Descriptive Name") before creating elements. Example:\n1. create_diagram(name: "CI/CD Pipeline", tags: ["ci-cd"])\n2. batch_create_elements(...)');
+        }
+        
+        logger.info('Batch creating elements via MCP', { count: params.elements.length, diagram: currentDiagram.name });
 
         const createdElements: ServerElement[] = [];
 
@@ -1466,8 +1776,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case 'clear_canvas': {
         logger.info('Clearing canvas via MCP');
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, {
-          method: 'DELETE'
+        const response = await fetch(withDiagramId('/api/elements/clear'), {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: activeContext.sessionId })
         });
 
         if (!response.ok) {
@@ -1484,6 +1796,299 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         };
       }
 
+      case 'list_diagrams': {
+        const diagrams = diagramStore.listDiagrams();
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ activeDiagramId: activeContext.diagramId, diagrams }, null, 2)
+          }]
+        };
+      }
+
+      case 'create_diagram': {
+        const params = z.object({
+          name: z.string(),
+          tags: z.array(z.string()).optional(),
+          description: z.string().optional()
+        }).parse(args || {});
+
+        const diagram = diagramStore.ensureDiagram({
+          id: generateId(),
+          name: params.name,
+          tags: params.tags || [],
+          description: params.description || null,
+        });
+        activateDiagram(diagram.id);
+        persistSceneState(diagram.id);
+
+        // Notify Express server to broadcast diagram update to all WebSocket clients
+        try {
+          const notifyUrl = withDiagramId('/api/internal/diagram-updated', diagram.id);
+          fetch(notifyUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              diagramId: diagram.id,
+              diagramName: diagram.name,
+              action: 'created'
+            })
+          }).catch(() => { /* ignore - frontend will poll */ });
+        } catch (_) { /* ignore notification failures */ }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ activeDiagramId: activeContext.diagramId, diagram }, null, 2)
+          }]
+        };
+      }
+
+      case 'get_diagram': {
+        const params = z.object({ diagramId: z.string().optional() }).parse(args || {});
+        const diagram = diagramStore.getDiagram(params.diagramId || activeContext.diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(diagram, null, 2)
+          }]
+        };
+      }
+
+      case 'update_diagram': {
+        const params = z.object({
+          diagramId: z.string(),
+          name: z.string().optional(),
+          tags: z.array(z.string()).optional(),
+          description: z.string().optional(),
+          archived: z.boolean().optional()
+        }).parse(args || {});
+        const diagram = diagramStore.updateDiagram(params.diagramId, {
+          name: params.name,
+          tags: params.tags,
+          description: params.description,
+          archivedAt: params.archived === undefined ? undefined : (params.archived ? new Date().toISOString() : null)
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(diagram, null, 2)
+          }]
+        };
+      }
+
+      case 'get_diagram_state': {
+        const params = z.object({ diagramId: z.string().optional() }).parse(args || {});
+        const state = diagramStore.getDiagramState(params.diagramId || activeContext.diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(state, null, 2)
+          }]
+        };
+      }
+
+      case 'get_active_diagram': {
+        const diagram = diagramStore.getDiagram(activeContext.diagramId);
+        const session = diagramStore.getSession(activeContext.sessionId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              sessionId: activeContext.sessionId,
+              activeDiagramId: activeContext.diagramId,
+              diagram,
+              session,
+            }, null, 2)
+          }]
+        };
+      }
+
+      case 'load_diagram': {
+        const params = z.object({ diagramId: z.string() }).parse(args || {});
+        const state = diagramStore.getDiagramState(params.diagramId);
+        activateDiagram(state.diagram.id);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              activeDiagramId: activeContext.diagramId,
+              diagram: state.diagram,
+              elementCount: state.elements.length,
+              snapshotCount: state.snapshots.length,
+              fileCount: state.files.length,
+              sceneState: state.sceneState,
+            }, null, 2)
+          }]
+        };
+      }
+
+      case 'set_active_diagram': {
+        const params = z.object({ diagramId: z.string() }).parse(args || {});
+        const diagram = diagramStore.getDiagram(params.diagramId);
+        activateDiagram(diagram.id);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ activeDiagramId: activeContext.diagramId, diagram }, null, 2)
+          }]
+        };
+      }
+
+      case 'duplicate_diagram': {
+        const params = z.object({ diagramId: z.string().optional(), name: z.string().optional() }).parse(args || {});
+        const diagram = diagramStore.duplicateDiagram(params.diagramId || activeContext.diagramId, params.name);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(diagram, null, 2)
+          }]
+        };
+      }
+
+      case 'delete_diagram': {
+        const params = z.object({ diagramId: z.string() }).parse(args || {});
+        const deleted = diagramStore.deleteDiagram(params.diagramId);
+        if (activeContext.diagramId === params.diagramId) {
+          activeContext.diagramId = DEFAULT_DIAGRAM_ID;
+          diagramStore.upsertSession({ id: activeContext.sessionId, activeDiagramId: DEFAULT_DIAGRAM_ID, status: 'active' });
+        }
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ deleted, diagramId: params.diagramId, activeDiagramId: activeContext.diagramId }, null, 2)
+          }]
+        };
+      }
+
+      case 'list_diagram_events': {
+        const params = z.object({ diagramId: z.string().optional(), limit: z.number().optional() }).parse(args || {});
+        const diagramId = params.diagramId || activeContext.diagramId;
+        const events = diagramStore.listEvents(diagramId, params.limit || 50);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ diagramId, events }, null, 2)
+          }]
+        };
+      }
+
+      case 'describe_scene': {
+        const params = z.object({ diagramId: z.string().optional() }).parse(args || {});
+        const diagramId = params.diagramId || activeContext.diagramId;
+        const elements = diagramStore.listElements(diagramId);
+        const byType = elements.reduce<Record<string, number>>((acc, element) => {
+          acc[element.type] = (acc[element.type] || 0) + 1;
+          return acc;
+        }, {});
+        const bbox = elements.length === 0 ? null : {
+          xMin: Math.min(...elements.map(el => el.x)),
+          xMax: Math.max(...elements.map(el => el.x + (el.width || 0))),
+          yMin: Math.min(...elements.map(el => el.y)),
+          yMax: Math.max(...elements.map(el => el.y + (el.height || 0)))
+        };
+        const arrows = elements
+          .filter(el => el.type === 'arrow' || el.type === 'line')
+          .map(el => ({ id: el.id, start: (el as any).start?.id || null, end: (el as any).end?.id || null, text: el.text || el.label?.text || null }));
+        const labels = elements
+          .map(el => ({ id: el.id, type: el.type, text: el.text || el.label?.text || null, x: el.x, y: el.y }))
+          .filter(el => el.text);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ diagramId, elementCount: elements.length, byType, bbox, arrows, labels }, null, 2)
+          }]
+        };
+      }
+
+      case 'search_diagrams': {
+        const params = z.object({
+          query: z.string().optional(),
+          tags: z.array(z.string()).optional()
+        }).parse(args || {});
+        const results = diagramStore.searchDiagrams(params.query || '', params.tags);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ diagrams: results, count: results.length }, null, 2)
+          }]
+        };
+      }
+
+      case 'list_recent_diagrams': {
+        const params = z.object({ limit: z.number().optional() }).parse(args || {});
+        const diagrams = diagramStore.listRecentDiagrams(params.limit || 10);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ diagrams, count: diagrams.length }, null, 2)
+          }]
+        };
+      }
+
+      case 'archive_diagram': {
+        const params = z.object({ diagramId: z.string() }).parse(args || {});
+        const diagram = diagramStore.archiveDiagram(params.diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ archived: true, diagram }, null, 2)
+          }]
+        };
+      }
+
+      case 'unarchive_diagram': {
+        const params = z.object({ diagramId: z.string() }).parse(args || {});
+        const diagram = diagramStore.unarchiveDiagram(params.diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ unarchived: true, diagram }, null, 2)
+          }]
+        };
+      }
+
+      case 'export_diagram': {
+        const params = z.object({ diagramId: z.string().optional() }).parse(args || {});
+        const diagramId = params.diagramId || activeContext.diagramId;
+        const state = diagramStore.exportDiagram(diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(state, null, 2)
+          }]
+        };
+      }
+
+      case 'import_diagram': {
+        const params = z.object({
+          data: z.string(),
+          targetId: z.string().optional()
+        }).parse(args || {});
+        const state = JSON.parse(params.data) as DiagramStateSnapshot;
+        const diagram = diagramStore.importDiagram(state, params.targetId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ imported: true, diagram }, null, 2)
+          }]
+        };
+      }
+
+      case 'set_thumbnail': {
+        const params = z.object({
+          diagramId: z.string(),
+          thumbnail: z.string()
+        }).parse(args || {});
+        const diagram = diagramStore.setDiagramThumbnail(params.diagramId, params.thumbnail);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ updated: true, diagram }, null, 2)
+          }]
+        };
+      }
+
       case 'export_scene': {
         const params = z.object({
           filePath: z.string().optional()
@@ -1491,7 +2096,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         logger.info('Exporting scene via MCP');
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
+        const response = await fetch(withDiagramId('/api/elements'), {
+          headers: {
+            'x-session-id': activeContext.sessionId,
+          },
+        });
         if (!response.ok) {
           throw new Error(`Failed to fetch elements: ${response.status} ${response.statusText}`);
         }
@@ -1499,15 +2108,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const data = await response.json() as ApiResponse;
         const sceneElements = data.elements || [];
 
-        // Fetch files for image elements
         let sceneFiles: Record<string, any> = {};
         try {
-          const filesResponse = await fetch(`${EXPRESS_SERVER_URL}/api/files`);
+          const filesResponse = await fetch(withDiagramId('/api/files'), {
+            headers: {
+              'x-session-id': activeContext.sessionId,
+            },
+          });
           if (filesResponse.ok) {
             const filesData = await filesResponse.json() as any;
             sceneFiles = filesData.files || {};
           }
-        } catch { /* files endpoint may not exist */ }
+        } catch { }
 
         const excalidrawScene: any = {
           type: 'excalidraw',
@@ -1562,7 +2174,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('Either filePath or data must be provided');
         }
 
-        // Extract elements from .excalidraw format or raw array
         const importElements: ServerElement[] = Array.isArray(sceneData)
           ? sceneData
           : (sceneData.elements || []);
@@ -1571,33 +2182,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('No elements found in the import data');
         }
 
-        // If replace mode, clear first
-        if (params.mode === 'replace') {
-          await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE' });
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/diagrams/${encodeURIComponent(activeContext.diagramId)}/import`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: activeContext.sessionId,
+            mode: params.mode,
+            elements: importElements,
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Import failed: ${response.status} ${response.statusText}`);
         }
 
-        // Batch create the imported elements
-        const elementsToCreate = importElements.map(el => ({
-          ...el,
-          id: el.id || generateId(),
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          version: 1
-        }));
+        const result = await response.json() as { success: boolean; count: number; backupSnapshot?: string | null };
 
-        const canvasElements = await batchCreateElementsOnCanvas(elementsToCreate);
-
-        // Import files if present (for image elements)
         let importedFileCount = 0;
         const importFiles = sceneData.files;
         if (importFiles && typeof importFiles === 'object') {
           const fileList = Object.values(importFiles);
           if (fileList.length > 0) {
             try {
-              await fetch(`${EXPRESS_SERVER_URL}/api/files`, {
+              await fetch(withDiagramId('/api/files'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(fileList)
+                body: JSON.stringify({ files: fileList, sessionId: activeContext.sessionId })
               });
               importedFileCount = fileList.length;
             } catch { /* best effort */ }
@@ -1607,7 +2217,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         return {
           content: [{
             type: 'text',
-            text: `Imported ${elementsToCreate.length} elements${importedFileCount > 0 ? ` and ${importedFileCount} files` : ''} (mode: ${params.mode})\n\n✅ Synced to canvas`
+            text: `Imported ${result.count} elements${importedFileCount > 0 ? ` and ${importedFileCount} files` : ''} (mode: ${params.mode})${result.backupSnapshot ? `\nBackup: ${result.backupSnapshot}` : ''}\n\n✅ Synced to canvas`
           }]
         };
       }
@@ -1616,17 +2226,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         const params = z.object({
           format: z.enum(['png', 'svg']),
           filePath: z.string().optional(),
-          background: z.boolean().optional()
+          background: z.boolean().optional(),
+          diagramId: z.string().optional()
         }).parse(args);
 
-        logger.info('Exporting to image via MCP', { format: params.format });
+        const diagramId = params.diagramId || activeContext.diagramId;
+        logger.info('Exporting to image via MCP', { format: params.format, diagramId });
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/export/image`, {
+        const response = await fetch(withDiagramId('/api/export/image', diagramId), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             format: params.format,
-            background: params.background ?? true
+            background: params.background ?? true,
+            sessionId: activeContext.sessionId
           })
         });
 
@@ -1710,13 +2323,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'snapshot_scene': {
-        const params = z.object({ name: z.string() }).parse(args);
-        logger.info('Saving snapshot via MCP', { name: params.name });
+        const params = z.object({ name: z.string(), diagramId: z.string().optional() }).parse(args);
+        const diagramId = params.diagramId || activeContext.diagramId;
+        logger.info('Saving snapshot via MCP', { name: params.name, diagramId });
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/snapshots`, {
+        const response = await fetch(withDiagramId('/api/snapshots', diagramId), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: params.name })
+          body: JSON.stringify({ name: params.name, sessionId: activeContext.sessionId })
         });
 
         if (!response.ok) {
@@ -1734,27 +2348,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       }
 
       case 'restore_snapshot': {
-        const params = z.object({ name: z.string() }).parse(args);
-        logger.info('Restoring snapshot via MCP', { name: params.name });
+        const params = z.object({ name: z.string(), diagramId: z.string().optional() }).parse(args);
+        const diagramId = params.diagramId || activeContext.diagramId;
+        logger.info('Restoring snapshot via MCP', { name: params.name, diagramId });
 
-        // Fetch the snapshot
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/snapshots/${encodeURIComponent(params.name)}`);
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/diagrams/${encodeURIComponent(diagramId)}/restore`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            snapshotName: params.name,
+            sessionId: activeContext.sessionId,
+          })
+        });
+
         if (!response.ok) {
           throw new Error(`Snapshot "${params.name}" not found`);
         }
 
-        const data = await response.json() as { success: boolean; snapshot: { name: string; elements: ServerElement[]; createdAt: string } };
-
-        // Clear current canvas
-        await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE' });
-
-        // Restore elements
-        const canvasElements = await batchCreateElementsOnCanvas(data.snapshot.elements);
+        const data = await response.json() as { success: boolean; elementCount: number; backupSnapshot?: string | null };
 
         return {
           content: [{
             type: 'text',
-            text: `Snapshot "${params.name}" restored (${data.snapshot.elements.length} elements)\n\n✅ Canvas updated`
+            text: `Snapshot "${params.name}" restored (${data.elementCount} elements)${data.backupSnapshot ? `\nBackup: ${data.backupSnapshot}` : ''}\n\n✅ Canvas updated`
           }]
         };
       }
@@ -1762,7 +2378,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
       case 'describe_scene': {
         logger.info('Describing scene via MCP');
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
+        const response = await fetch(withDiagramId('/api/elements'));
         if (!response.ok) {
           throw new Error(`Failed to fetch elements: ${response.status}`);
         }
@@ -1872,17 +2488,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
       case 'get_canvas_screenshot': {
         const params = z.object({
-          background: z.boolean().optional()
+          background: z.boolean().optional(),
+          diagramId: z.string().optional()
         }).parse(args || {});
 
-        logger.info('Taking canvas screenshot via MCP');
+        const diagramId = params.diagramId || activeContext.diagramId;
+        logger.info('Taking canvas screenshot via MCP', { diagramId });
 
-        const response = await fetch(`${EXPRESS_SERVER_URL}/api/export/image`, {
+        const response = await fetch(withDiagramId('/api/export/image', diagramId), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             format: 'png',
-            background: params.background ?? true
+            background: params.background ?? true,
+            sessionId: activeContext.sessionId
           })
         });
 
@@ -1918,7 +2537,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         logger.info('Exporting to excalidraw.com URL');
 
         // 1. Fetch current scene elements
-        const urlExportResponse = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
+        const urlExportResponse = await fetch(withDiagramId('/api/elements'));
         if (!urlExportResponse.ok) {
           throw new Error(`Failed to fetch elements: ${urlExportResponse.status}`);
         }
@@ -2210,15 +2829,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           scrollToElementId: z.string().optional(),
           zoom: z.number().min(0.1).max(10).optional(),
           offsetX: z.number().optional(),
-          offsetY: z.number().optional()
+          offsetY: z.number().optional(),
+          diagramId: z.string().optional()
         }).parse(args || {});
 
-        logger.info('Setting viewport via MCP', viewportParams);
+        const diagramId = viewportParams.diagramId || activeContext.diagramId;
+        logger.info('Setting viewport via MCP', { ...viewportParams, diagramId });
 
-        const viewportResponse = await fetch(`${EXPRESS_SERVER_URL}/api/viewport`, {
+        const viewportResponse = await fetch(withDiagramId('/api/viewport', diagramId), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(viewportParams)
+          body: JSON.stringify({
+            scrollToContent: viewportParams.scrollToContent,
+            scrollToElementId: viewportParams.scrollToElementId,
+            zoom: viewportParams.zoom,
+            offsetX: viewportParams.offsetX,
+            offsetY: viewportParams.offsetY,
+            sessionId: activeContext.sessionId,
+          })
         });
 
         if (!viewportResponse.ok) {
@@ -2232,6 +2860,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           content: [{
             type: 'text',
             text: `Viewport updated successfully.\n\n${JSON.stringify(viewportResult, null, 2)}`
+          }]
+        };
+      }
+
+      case 'server_info': {
+        const diagrams = diagramStore.listDiagrams();
+        const currentDiagram = diagramStore.getDiagram(activeContext.diagramId);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              server: "mcp-excalidraw-server",
+              version: "2.0.0",
+              sessionId: activeContext.sessionId,
+              sessionName: activeContext.sessionName,
+              activeDiagramId: activeContext.diagramId,
+              activeDiagramName: currentDiagram?.name || 'unknown',
+              totalDiagrams: diagrams.length,
+              diagrams: diagrams.map(d => ({ id: d.id, name: d.name, tags: d.tags }))
+            }, null, 2)
           }]
         };
       }

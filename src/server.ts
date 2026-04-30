@@ -8,9 +8,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import {
-  elements,
-  files,
-  snapshots,
+  DEFAULT_DIAGRAM_ID,
   generateId,
   EXCALIDRAW_ELEMENT_TYPES,
   ServerElement,
@@ -24,10 +22,25 @@ import {
   SyncStatusMessage,
   InitialElementsMessage,
   Snapshot,
-  normalizeFontFamily
+  normalizeFontFamily,
+  validateElementLimits,
+  validatePayloadSize,
+  validateBatchOperation,
+  SyncMetrics,
+  PerformanceMetrics,
+  HealthMetrics,
+  VALIDATION_LIMITS,
 } from './types.js';
+import { diagramStore } from './db.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
+import {
+  recordSyncMetric,
+  recordPerformanceMetric,
+  getRecentSyncMetrics,
+  getRecentPerformanceMetrics,
+  getHealthMetrics,
+} from './utils/observability.js';
 
 // Load environment variables
 dotenv.config();
@@ -53,22 +66,272 @@ app.use('/assets/fonts', express.static(
   path.join(__dirname, '../node_modules/@excalidraw/excalidraw/dist/prod/fonts')
 ));
 
-// WebSocket connections
-const clients = new Set<WebSocket>();
+// Active diagram tracking per session (in-memory, synced with DB)
+const activeDiagramBySession = new Map<string, string>(); // sessionId -> diagramId
 
-// Broadcast to all connected clients
-function broadcast(message: WebSocketMessage): void {
+// Session middleware: extracts session context and resolves active diagram
+function sessionMiddleware(req: Request, _res: Response, next: NextFunction): void {
+  const sessionId = getSessionIdFromRequest(req);
+  if (sessionId) {
+    // Attach sessionId to request for downstream handlers
+    (req as any).sessionId = sessionId;
+
+    // Look up active diagram from in-memory map first, then DB
+    let activeDiagramId = activeDiagramBySession.get(sessionId);
+    if (!activeDiagramId) {
+      const session = diagramStore.getSession(sessionId);
+      activeDiagramId = session?.activeDiagramId;
+      // Cache it for future requests
+      if (activeDiagramId) {
+        activeDiagramBySession.set(sessionId, activeDiagramId);
+      }
+    }
+    if (activeDiagramId) {
+      (req as any).diagramId = activeDiagramId;
+    }
+  }
+  next();
+}
+
+// Register session middleware early in the chain
+app.use(sessionMiddleware);
+
+// WebSocket connections — scoped by diagramId
+interface DiagramClient {
+  ws: WebSocket;
+  diagramId: string;
+  sessionId: string;
+  lastHeartbeat: number;
+}
+
+const clients = new Set<WebSocket>(); // legacy global set kept for compat
+const diagramClients = new Map<string, Set<DiagramClient>>(); // diagramId → clients
+
+function registerDiagramClient(client: DiagramClient): void {
+  clients.add(client.ws);
+  if (!diagramClients.has(client.diagramId)) {
+    diagramClients.set(client.diagramId, new Set());
+  }
+  diagramClients.get(client.diagramId)!.add(client);
+}
+
+function removeDiagramClient(ws: WebSocket): void {
+  clients.delete(ws);
+  diagramClients.forEach((set) => {
+    set.forEach((c) => {
+      if (c.ws === ws) set.delete(c);
+    });
+  });
+}
+
+function listDiagramFiles(diagramId: string): Record<string, ExcalidrawFile> {
+  const filesObj: Record<string, ExcalidrawFile> = {};
+  diagramStore.listFiles(diagramId).forEach(file => {
+    filesObj[file.id] = file;
+  });
+  return filesObj;
+}
+
+// Broadcast to all clients watching a specific diagram
+function broadcastToDiagram(diagramId: string, message: WebSocketMessage, excludeSessionId?: string): void {
   const data = JSON.stringify(message);
-  clients.forEach(client => {
+  const set = diagramClients.get(diagramId);
+  if (!set) return;
+  set.forEach(client => {
+    if (excludeSessionId && client.sessionId === excludeSessionId) return;
     try {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(data);
       }
     } catch (err) {
-      logger.warn('Failed to send to client, removing');
-      clients.delete(client);
+      logger.warn('Failed to send to diagram client, removing');
+      removeDiagramClient(client.ws);
     }
   });
+}
+
+// Broadcast to all clients belonging to a specific session
+function broadcastToSession(sessionId: string, message: WebSocketMessage, diagramId?: string): void {
+  const data = JSON.stringify(message);
+  // If diagramId is provided, scope the search to that diagram's clients
+  // Otherwise search all diagram client sets
+  if (diagramId) {
+    const set = diagramClients.get(diagramId);
+    if (set) {
+      set.forEach(client => {
+        if (client.sessionId !== sessionId) return;
+        try {
+          if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(data);
+          }
+        } catch (err) {
+          logger.warn('Failed to send to session client, removing');
+          removeDiagramClient(client.ws);
+        }
+      });
+    }
+  } else {
+    // Search all diagrams for clients of this session
+    diagramClients.forEach(set => {
+      set.forEach(client => {
+        if (client.sessionId !== sessionId) return;
+        try {
+          if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(data);
+          }
+        } catch (err) {
+          logger.warn('Failed to send to session client, removing');
+          removeDiagramClient(client.ws);
+        }
+      });
+    });
+  }
+}
+
+// Broadcast to all connected clients (global fallback)
+function broadcast(message: WebSocketMessage, diagramId: string): void {
+  broadcastToDiagram(diagramId, message);
+}
+
+function currentElements(diagramId: string): ServerElement[] {
+  return diagramStore.listElements(diagramId);
+}
+
+function currentElementCount(diagramId: string): number {
+  return currentElements(diagramId).length;
+}
+
+function getElementMap(diagramId: string): Map<string, ServerElement> {
+  return new Map(currentElements(diagramId).map(element => [element.id, element]));
+}
+
+function persistElement(diagramId: string, element: ServerElement): ServerElement {
+  return diagramStore.upsertElement(diagramId, element);
+}
+
+function persistElements(diagramId: string, nextElements: ServerElement[]): void {
+  diagramStore.replaceElements(diagramId, nextElements);
+}
+
+function removeElement(diagramId: string, elementId: string): boolean {
+  return diagramStore.deleteElement(diagramId, elementId);
+}
+
+function clearElements(diagramId: string): number {
+  return diagramStore.clearDiagram(diagramId);
+}
+
+function getSnapshotMap(diagramId: string): Map<string, Snapshot> {
+  return new Map(
+    diagramStore.listSnapshots(diagramId).map(snapshot => [snapshot.name, {
+      name: snapshot.name,
+      elements: snapshot.elements,
+      createdAt: snapshot.createdAt,
+    }])
+  );
+}
+
+function getSnapshotByName(diagramId: string, name: string): Snapshot | null {
+  const snapshot = diagramStore.getSnapshot(diagramId, name);
+  if (!snapshot) return null;
+  return {
+    name: snapshot.name,
+    elements: snapshot.elements,
+    createdAt: snapshot.createdAt,
+  };
+}
+
+function saveSnapshotRecord(diagramId: string, snapshot: Snapshot, sessionId?: string): void {
+  diagramStore.saveSnapshot(diagramId, snapshot, sessionId);
+
+  // Clean up old auto-* snapshots for this diagram, keeping only 3 most recent
+  if (snapshot.name.startsWith('auto-')) {
+    const allSnapshots = Array.from(getSnapshotMap(diagramId).values())
+      .filter(s => s.name.startsWith('auto-'))
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    if (allSnapshots.length > 3) {
+      const toDelete = allSnapshots.slice(3);
+      toDelete.forEach(s => {
+        diagramStore.deleteSnapshot(diagramId, s.name);
+        logger.debug(`Cleaned up old backup: ${s.name}`);
+      });
+    }
+  }
+}
+
+function createAutomaticBackup(diagramId: string, reason: string, sessionId?: string): Snapshot | null {
+  const elements = currentElements(diagramId);
+  if (elements.length === 0) {
+    return null;
+  }
+
+  const snapshot: Snapshot = {
+    name: `auto-${reason}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+    elements,
+    createdAt: new Date().toISOString(),
+  };
+
+  saveSnapshotRecord(diagramId, snapshot, sessionId);
+  return snapshot;
+}
+
+function upsertFiles(diagramId: string, nextFiles: ExcalidrawFile[], sessionId?: string): void {
+  diagramStore.upsertFiles(diagramId, nextFiles, sessionId);
+}
+
+function deleteFileRecord(diagramId: string, fileId: string): boolean {
+  return diagramStore.deleteFile(diagramId, fileId);
+}
+
+function listFiles(diagramId: string): ExcalidrawFile[] {
+  return diagramStore.listFiles(diagramId);
+}
+
+function touchSession(sessionId: string, diagramId = DEFAULT_DIAGRAM_ID): void {
+  // Update in-memory active diagram map
+  activeDiagramBySession.set(sessionId, diagramId);
+  // Persist to DB
+  diagramStore.upsertSession({ id: sessionId, activeDiagramId: diagramId, status: 'active' });
+}
+
+const serverSessionId = 'canvas-server';
+touchSession(serverSessionId, DEFAULT_DIAGRAM_ID);
+
+function getSessionIdFromRequest(req: Request): string | undefined {
+  const queryValue = req.query.sessionId;
+  if (typeof queryValue === 'string' && queryValue.trim()) {
+    return queryValue;
+  }
+
+  const bodyValue = req.body?.sessionId;
+  if (typeof bodyValue === 'string' && bodyValue.trim()) {
+    return bodyValue;
+  }
+
+  return undefined;
+}
+
+function getDiagramIdFromRequest(req: Request): string {
+  const queryValue = req.query.diagramId;
+  if (typeof queryValue === 'string' && queryValue.trim()) {
+    return queryValue;
+  }
+
+  const bodyValue = req.body?.diagramId;
+  if (typeof bodyValue === 'string' && bodyValue.trim()) {
+    return bodyValue;
+  }
+
+  const sessionId = getSessionIdFromRequest(req);
+  if (sessionId) {
+    const session = diagramStore.getSession(sessionId);
+    if (session?.activeDiagramId) {
+      return session.activeDiagramId;
+    }
+  }
+
+  return DEFAULT_DIAGRAM_ID;
 }
 
 function normalizeLineBreakMarkup(text: string): string {
@@ -78,36 +341,44 @@ function normalizeLineBreakMarkup(text: string): string {
 }
 
 // WebSocket connection handling
-wss.on('connection', (ws: WebSocket) => {
-  clients.add(ws);
-  logger.info('New WebSocket connection established');
+wss.on('connection', (ws: WebSocket, req) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host}`);
+  const diagramId = url.searchParams.get('diagramId') || DEFAULT_DIAGRAM_ID;
+  const sessionId = url.searchParams.get('sessionId') || `ws-${generateId()}`;
 
-  // Send current elements to new client
-  const filesObj: Record<string, ExcalidrawFile> = {};
-  files.forEach((f, id) => { filesObj[id] = f; });
+  const client: DiagramClient = { ws, diagramId, sessionId, lastHeartbeat: Date.now() };
+  registerDiagramClient(client);
+  logger.info(`New WebSocket connection: diagram=${diagramId} session=${sessionId}`);
+
+  const filesObj = listDiagramFiles(diagramId);
+  const initialElements = currentElements(diagramId);
   const initialMessage: InitialElementsMessage & { files?: Record<string, ExcalidrawFile> } = {
     type: 'initial_elements',
-    elements: Array.from(elements.values()),
-    ...(files.size > 0 ? { files: filesObj } : {})
+    elements: initialElements,
+    ...(Object.keys(filesObj).length > 0 ? { files: filesObj } : {})
   };
   ws.send(JSON.stringify(initialMessage));
 
-  // Send sync status to new client
   const syncMessage: SyncStatusMessage = {
     type: 'sync_status',
-    elementCount: elements.size,
+    elementCount: initialElements.length,
     timestamp: new Date().toISOString()
   };
   ws.send(JSON.stringify(syncMessage));
 
+  touchSession(sessionId, diagramId);
+
   ws.on('close', () => {
-    clients.delete(ws);
-    logger.info('WebSocket connection closed');
+    removeDiagramClient(ws);
+    diagramStore.markSessionStatus(sessionId, 'closed');
+    // Clean up in-memory session tracking
+    activeDiagramBySession.delete(sessionId);
+    logger.info(`WebSocket closed: diagram=${diagramId} session=${sessionId}`);
   });
 
   ws.on('error', (error) => {
     logger.error('WebSocket error:', error);
-    clients.delete(ws);
+    removeDiagramClient(ws);
   });
 });
 
@@ -230,7 +501,8 @@ const UpdateElementSchema = z.object({
 // Get all elements
 app.get('/api/elements', (req: Request, res: Response) => {
   try {
-    const elementsArray = Array.from(elements.values());
+    const diagramId = getDiagramIdFromRequest(req);
+    const elementsArray = currentElements(diagramId);
     res.json({
       success: true,
       elements: elementsArray,
@@ -248,10 +520,11 @@ app.get('/api/elements', (req: Request, res: Response) => {
 // Create new element
 app.post('/api/elements', (req: Request, res: Response) => {
   try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const sessionId = getSessionIdFromRequest(req);
     const params = CreateElementSchema.parse(req.body);
-    logger.info('Creating element via API', { type: params.type });
+    logger.info('Creating element via API', { type: params.type, diagramId, sessionId });
 
-    // Prioritize passed ID (for MCP sync), otherwise generate new ID
     const id = params.id || generateId();
     const element: ServerElement = {
       id,
@@ -262,23 +535,29 @@ app.post('/api/elements', (req: Request, res: Response) => {
       version: 1
     };
 
-    // Resolve arrow bindings against existing elements
     if (element.type === 'arrow' || element.type === 'line') {
-      resolveArrowBindings([element]);
+      resolveArrowBindings(diagramId, [element]);
     }
 
-    elements.set(id, element);
+    const persistedElement = sessionId
+      ? diagramStore.upsertElementWithSession(diagramId, element, sessionId)
+      : persistElement(diagramId, element);
 
-    // Broadcast to all connected clients
+    if (sessionId) {
+      touchSession(sessionId, diagramId);
+    }
+
     const message: ElementCreatedMessage = {
       type: 'element_created',
-      element: element
+      element: persistedElement
     };
-    broadcast(message);
+    if (sessionId) {
+      broadcastToSession(sessionId, message, diagramId);
+    }
 
     res.json({
       success: true,
-      element: element
+      element: persistedElement
     });
   } catch (error) {
     logger.error('Error creating element:', error);
@@ -302,7 +581,9 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       });
     }
 
-    const existingElement = elements.get(id);
+    const diagramId = getDiagramIdFromRequest(req);
+    const sessionId = getSessionIdFromRequest(req);
+    const existingElement = diagramStore.getElement(diagramId, id);
     if (!existingElement) {
       return res.status(404).json({
         success: false,
@@ -342,18 +623,26 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       }
     }
 
-    elements.set(id, updatedElement);
+    const persistedElement = sessionId
+      ? diagramStore.upsertElementWithSession(diagramId, updatedElement, sessionId)
+      : persistElement(diagramId, updatedElement);
+
+    if (sessionId) {
+      touchSession(sessionId, diagramId);
+    }
 
     // Broadcast to all connected clients
     const message: ElementUpdatedMessage = {
       type: 'element_updated',
-      element: updatedElement
+      element: persistedElement
     };
-    broadcast(message);
+    if (sessionId) {
+      broadcastToSession(sessionId, message, diagramId);
+    }
 
     res.json({
       success: true,
-      element: updatedElement
+      element: persistedElement
     });
   } catch (error) {
     logger.error('Error updating element:', error);
@@ -367,20 +656,41 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
 // Clear all elements (must be before /:id route)
 app.delete('/api/elements/clear', (req: Request, res: Response) => {
   try {
-    const count = elements.size;
-    elements.clear();
+    const diagramId = getDiagramIdFromRequest(req);
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined;
 
-    broadcast({
-      type: 'canvas_cleared',
-      timestamp: new Date().toISOString()
-    });
+    // Check operation lock - warn if another session is performing a destructive action
+    const lock = diagramStore.getOperationLock('clear');
+    if (lock && lock.lockedBySessionId !== sessionId) {
+      logger.warn(`Clear operation blocked by lock held by session ${lock.lockedBySessionId}`);
+      return res.status(409).json({
+        success: false,
+        error: `Another session is currently clearing the canvas. Please try again later.`,
+        operationLock: {
+          lockedBySessionId: lock.lockedBySessionId,
+          lockedAt: lock.lockedAt,
+          expiresAt: lock.expiresAt,
+        }
+      });
+    }
+
+    const backup = createAutomaticBackup(diagramId, 'clear', sessionId);
+    const count = clearElements(diagramId);
+
+    if (sessionId) {
+      broadcastToSession(sessionId, {
+        type: 'canvas_cleared',
+        timestamp: new Date().toISOString()
+      }, diagramId);
+    }
 
     logger.info(`Canvas cleared: ${count} elements removed`);
 
     res.json({
       success: true,
       message: `Cleared ${count} elements`,
-      count
+      count,
+      backupSnapshot: backup?.name ?? null
     });
   } catch (error) {
     logger.error('Error clearing canvas:', error);
@@ -403,25 +713,40 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
       });
     }
 
-    if (!elements.has(id)) {
+    const diagramId = getDiagramIdFromRequest(req);
+    const sessionId = getSessionIdFromRequest(req);
+    const existingElement = diagramStore.getElement(diagramId, id);
+    if (!existingElement) {
       return res.status(404).json({
         success: false,
         error: `Element with ID ${id} not found`
       });
     }
 
-    elements.delete(id);
+    // Create automatic backup before destructive delete operation
+    const backup = createAutomaticBackup(diagramId, 'delete', sessionId);
+
+    if (sessionId) {
+      diagramStore.deleteElementWithSession(diagramId, id, sessionId);
+      touchSession(sessionId, diagramId);
+    } else {
+      removeElement(diagramId, id);
+    }
+
 
     // Broadcast to all connected clients
     const message: ElementDeletedMessage = {
       type: 'element_deleted',
       elementId: id!
     };
-    broadcast(message);
+    if (sessionId) {
+      broadcastToSession(sessionId, message, diagramId);
+    }
 
     res.json({
       success: true,
-      message: `Element ${id} deleted successfully`
+      message: `Element ${id} deleted successfully`,
+      backupSnapshot: backup?.name ?? null
     });
   } catch (error) {
     logger.error('Error deleting element:', error);
@@ -436,7 +761,8 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
 app.get('/api/elements/search', (req: Request, res: Response) => {
   try {
     const { type, x_min, x_max, y_min, y_max, ...filters } = req.query;
-    let results = Array.from(elements.values());
+    const diagramId = getDiagramIdFromRequest(req);
+    let results = currentElements(diagramId);
 
     // Filter by type if specified
     if (type && typeof type === 'string') {
@@ -493,7 +819,8 @@ app.get('/api/elements/:id', (req: Request, res: Response) => {
       });
     }
 
-    const element = elements.get(id);
+    const diagramId = getDiagramIdFromRequest(req);
+    const element = diagramStore.getElement(diagramId, id);
 
     if (!element) {
       return res.status(404).json({
@@ -568,12 +895,11 @@ function computeEdgePoint(
 }
 
 // Helper: resolve arrow bindings in a batch
-function resolveArrowBindings(batchElements: ServerElement[]): void {
+function resolveArrowBindings(diagramId: string, batchElements: ServerElement[]): void {
   const elementMap = new Map<string, ServerElement>();
   batchElements.forEach(el => elementMap.set(el.id, el));
 
-  // Also check existing elements for cross-batch references
-  elements.forEach((el, id) => {
+  getElementMap(diagramId).forEach((el, id) => {
     if (!elementMap.has(id)) elementMap.set(id, el);
   });
 
@@ -634,6 +960,8 @@ function resolveArrowBindings(batchElements: ServerElement[]): void {
 // Batch create elements
 app.post('/api/elements/batch', (req: Request, res: Response) => {
   try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const sessionId = getSessionIdFromRequest(req);
     const { elements: elementsToCreate } = req.body;
 
     if (!Array.isArray(elementsToCreate)) {
@@ -662,17 +990,24 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
     });
 
     // Resolve arrow bindings (computes positions, startBinding, endBinding, boundElements)
-    resolveArrowBindings(createdElements);
+    resolveArrowBindings(diagramId, createdElements);
 
     // Store all elements after binding resolution
-    createdElements.forEach(el => elements.set(el.id, el));
+    if (sessionId) {
+      diagramStore.replaceElementsWithSession(diagramId, createdElements, sessionId);
+      touchSession(sessionId, diagramId);
+    } else {
+      persistElements(diagramId, createdElements);
+    }
 
     // Broadcast to all connected clients
     const message: BatchCreatedMessage = {
       type: 'elements_batch_created',
       elements: createdElements
     };
-    broadcast(message);
+    if (sessionId) {
+      broadcastToSession(sessionId, message, diagramId);
+    }
 
     res.json({
       success: true,
@@ -706,7 +1041,8 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
     });
 
     // Broadcast to all WebSocket clients to process the Mermaid diagram
-    broadcast({
+    const diagramId = getDiagramIdFromRequest(req);
+    broadcastToDiagram(diagramId, {
       type: 'mermaid_convert',
       mermaidDiagram,
       config: config || {},
@@ -729,17 +1065,17 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
   }
 });
 
-// Sync elements from frontend (overwrite sync)
+// Sync elements from frontend using version-aware full-scene replacement
 app.post('/api/elements/sync', (req: Request, res: Response) => {
+  const startTime = Date.now();
   try {
-    const { elements: frontendElements, timestamp } = req.body;
-
-    logger.info(`Sync request received: ${frontendElements.length} elements`, {
+    const {
+      elements: frontendElements,
       timestamp,
-      elementCount: frontendElements.length
-    });
+      sessionId = `frontend-${generateId()}`,
+      baseVersion = 0
+    } = req.body;
 
-    // Validate input data
     if (!Array.isArray(frontendElements)) {
       return res.status(400).json({
         success: false,
@@ -747,63 +1083,131 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       });
     }
 
-    // Record element count before sync
-    const beforeCount = elements.size;
+    const diagramId = getDiagramIdFromRequest(req);
 
-    // 1. Clear existing memory storage
-    elements.clear();
-    logger.info(`Cleared existing elements: ${beforeCount} elements removed`);
+    // Schema hardening: validate sync payload
+    const payloadValidation = validatePayloadSize(frontendElements);
+    if (!payloadValidation.valid) {
+      return res.status(413).json({
+        success: false,
+        error: 'Payload too large',
+        details: payloadValidation.errors
+      });
+    }
 
-    // 2. Batch write new data
-    let successCount = 0;
+    const batchValidation = validateBatchOperation(frontendElements);
+    if (!batchValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Sync validation failed',
+        details: batchValidation.errors
+      });
+    }
+
+    const beforeCount = currentElementCount(diagramId);
+    const currentVersion = diagramStore.getDiagramVersion(diagramId);
+    const hasConflict = baseVersion !== currentVersion;
+
+    logger.info(`Sync request received: ${frontendElements.length} elements`, {
+      timestamp,
+      sessionId,
+      baseVersion,
+      currentVersion,
+      diagramId,
+      elementCount: frontendElements.length
+    });
+
+    diagramStore.upsertSession({
+      id: sessionId,
+      activeDiagramId: diagramId,
+      status: 'active',
+      lastSyncAt: new Date().toISOString(),
+      lastAckVersion: currentVersion
+    });
+
     const processedElements: ServerElement[] = [];
-
     frontendElements.forEach((element: any, index: number) => {
       try {
-        // Ensure element has ID, generate one if missing
-        const elementId = element.id || generateId();
+        // Validate individual element limits
+        const elementValidation = validateElementLimits(element);
+        if (!elementValidation.valid) {
+          logger.warn(`Element ${index} validation failed:`, elementValidation.errors);
+        }
 
-        // Add server metadata
-        const processedElement: ServerElement = {
+        const elementId = element.id || generateId();
+        processedElements.push({
           ...element,
           id: elementId,
           syncedAt: new Date().toISOString(),
           source: 'frontend_sync',
           syncTimestamp: timestamp,
-          version: 1
-        };
-
-        // Store to memory
-        elements.set(elementId, processedElement);
-        processedElements.push(processedElement);
-        successCount++;
-
+          version: element.version || 1
+        });
       } catch (elementError) {
         logger.warn(`Failed to process element ${index}:`, elementError);
       }
     });
 
-    logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`);
+    diagramStore.replaceElementsWithSession(diagramId, processedElements, sessionId);
+    const serverVersion = diagramStore.getDiagramVersion(diagramId);
+    diagramStore.acknowledgeSessionVersion(sessionId, diagramId, serverVersion);
 
-    // 3. Broadcast sync event to all WebSocket clients
-    broadcast({
-      type: 'elements_synced',
-      count: successCount,
+    if (sessionId) {
+      broadcastToSession(sessionId, {
+        type: 'elements_synced',
+        count: processedElements.length,
+        timestamp: new Date().toISOString(),
+        source: 'versioned_sync',
+        sessionId,
+        diagramId,
+        serverVersion,
+        conflicts: hasConflict
+      }, diagramId);
+    }
+
+    const durationMs = Date.now() - startTime;
+    recordSyncMetric({
+      operationType: 'sync',
+      diagramId,
+      sessionId,
+      elementCount: processedElements.length,
+      durationMs,
+      success: true,
       timestamp: new Date().toISOString(),
-      source: 'manual_sync'
+    });
+    recordPerformanceMetric({
+      diagramId,
+      elementCount: processedElements.length,
+      operationType: 'sync',
+      durationMs,
+      timestamp: new Date().toISOString(),
     });
 
-    // 4. Return sync results
     res.json({
       success: true,
-      message: `Successfully synced ${successCount} elements`,
-      count: successCount,
+      applied: true,
+      conflicts: hasConflict,
+      diagramId,
+      sessionId,
+      serverVersion,
+      count: processedElements.length,
       syncedAt: new Date().toISOString(),
       beforeCount,
-      afterCount: elements.size
+      afterCount: currentElementCount(diagramId)
     });
-
   } catch (error) {
+    const durationMs = Date.now() - startTime;
+    const diagramId = getDiagramIdFromRequest(req);
+    recordSyncMetric({
+      operationType: 'sync',
+      diagramId,
+      sessionId: getSessionIdFromRequest(req),
+      elementCount: 0,
+      durationMs,
+      success: false,
+      error: (error as Error).message,
+      timestamp: new Date().toISOString(),
+    });
     logger.error('Sync error:', error);
     res.status(500).json({
       success: false,
@@ -813,33 +1217,246 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
   }
 });
 
+// Get sync state for a diagram or session
+app.get('/api/elements/sync/state', (req: Request, res: Response) => {
+  try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const serverVersion = diagramStore.getDiagramVersion(diagramId);
+    const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+    const updatedElements = typeof req.query.afterVersion === 'string'
+      ? diagramStore.getElementsUpdatedAfterVersion(diagramId, Number(req.query.afterVersion))
+      : [];
+    const deletedElementIds = typeof req.query.afterVersion === 'string'
+      ? diagramStore.listDeletedElementIdsAfterVersion(diagramId, Number(req.query.afterVersion))
+      : [];
+
+    if (sessionId) {
+      diagramStore.acknowledgeSessionVersion(sessionId, diagramId, serverVersion);
+    }
+
+    res.json({
+      success: true,
+      diagramId,
+      sessionId,
+      serverVersion,
+      elements: updatedElements,
+      deletedElementIds,
+      count: updatedElements.length
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// Explicitly acknowledge the current server version for a session
+app.post('/api/elements/sync/ack', (req: Request, res: Response) => {
+  try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const { sessionId, serverVersion } = req.body;
+    if (!sessionId || typeof sessionId !== 'string') {
+      return res.status(400).json({ success: false, error: 'sessionId is required' });
+    }
+    const acknowledgedVersion = typeof serverVersion === 'number'
+      ? serverVersion
+      : diagramStore.getDiagramVersion(diagramId);
+    const session = diagramStore.acknowledgeSessionVersion(sessionId, diagramId, acknowledgedVersion);
+    res.json({ success: true, session, serverVersion: acknowledgedVersion });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Return the full current scene and server version for reconnect/reload
+app.get('/api/scene', (req: Request, res: Response) => {
+  try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const filesObj: Record<string, ExcalidrawFile> = {};
+    listFiles(diagramId).forEach((f) => { filesObj[f.id] = f; });
+    res.json({
+      success: true,
+      diagramId,
+      serverVersion: diagramStore.getDiagramVersion(diagramId),
+      elements: currentElements(diagramId),
+      files: filesObj
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Session heartbeat — frontend pings periodically to keep session alive
+app.post('/api/sessions/heartbeat', (req: Request, res: Response) => {
+  try {
+    const { sessionId, diagramId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: 'sessionId is required' });
+    }
+    const did = typeof diagramId === 'string' && diagramId.trim() ? diagramId : DEFAULT_DIAGRAM_ID;
+    const staleBefore = new Date(Date.now() - 30000).toISOString();
+    diagramStore.markStaleSessions(staleBefore);
+    touchSession(sessionId, did);
+    const serverVersion = diagramStore.getDiagramVersion(did);
+
+    // Get active and conflicting sessions for presence awareness
+    const activeSessions = diagramStore.listActiveSessions(did);
+    const conflictingSessions = diagramStore.listConflictingSessions(did);
+    const allSessions = diagramStore.listSessions(did);
+    const staleCount = allSessions.filter(s => s.status === 'stale').length;
+
+    // Include presence warnings if other active sessions are on the same diagram
+    const otherActiveCount = activeSessions.filter(s => s.id !== sessionId).length;
+    const presenceWarnings: string[] = [];
+    if (otherActiveCount > 0) {
+      presenceWarnings.push(`${otherActiveCount} other session${otherActiveCount > 1 ? 's' : ''} currently editing this diagram`);
+    }
+    if (conflictingSessions.length > 0) {
+      presenceWarnings.push(`${conflictingSessions.length} session${conflictingSessions.length > 1 ? 's' : ''} with unacknowledged changes`);
+    }
+
+    res.json({
+      success: true,
+      serverVersion,
+      activeSessionCount: activeSessions.length,
+      staleCount,
+      conflictingCount: conflictingSessions.length,
+      presenceWarnings,
+      sessions: activeSessions
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Acquire operation lock (for explicit locking of destructive actions)
+app.post('/api/sessions/lock', (req: Request, res: Response) => {
+  try {
+    const { sessionId, operationType, ttlMs } = req.body;
+    if (!sessionId || !operationType) {
+      return res.status(400).json({ success: false, error: 'sessionId and operationType are required' });
+    }
+    const ttl = typeof ttlMs === 'number' ? ttlMs : 30000;
+    const acquired = diagramStore.acquireOperationLock(operationType, sessionId, ttl);
+    if (!acquired) {
+      const lock = diagramStore.getOperationLock(operationType);
+      return res.status(409).json({
+        success: false,
+        error: `Operation lock for '${operationType}' is held by another session`,
+        lock: lock || null
+      });
+    }
+    res.json({ success: true, operationType, lockedBySessionId: sessionId });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Release operation lock
+app.post('/api/sessions/unlock', (req: Request, res: Response) => {
+  try {
+    const { sessionId, operationType } = req.body;
+    if (!sessionId || !operationType) {
+      return res.status(400).json({ success: false, error: 'sessionId and operationType are required' });
+    }
+    const released = diagramStore.releaseOperationLock(operationType, sessionId);
+    res.json({ success: true, released, operationType });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Get current lock status
+app.get('/api/sessions/lock/:operationType', (req: Request, res: Response) => {
+  try {
+    const operationType = req.params.operationType;
+    if (!operationType) {
+      return res.status(400).json({ success: false, error: 'operationType is required' });
+    }
+    const validTypes = ['clear', 'bulk_delete', 'restore', 'import'] as const;
+    if (!validTypes.includes(operationType as typeof validTypes[number])) {
+      return res.status(400).json({ success: false, error: `Invalid operationType. Must be one of: ${validTypes.join(', ')}` });
+    }
+    const lock = diagramStore.getOperationLock(operationType as 'clear' | 'bulk_delete' | 'restore' | 'import');
+    res.json({ success: true, lock });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Get session presence info for a diagram
+app.get('/api/diagrams/:id/presence', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const activeSessions = diagramStore.listActiveSessions(diagramId);
+    const conflictingSessions = diagramStore.listConflictingSessions(diagramId);
+    const serverVersion = diagramStore.getDiagramVersion(diagramId);
+
+    // Calculate which sessions need to acknowledge the current version
+    const sessionsNeedingAck = activeSessions.filter(s =>
+      s.lastAckVersion < serverVersion && s.lastAckVersion >= 0
+    );
+
+    res.json({
+      success: true,
+      diagramId,
+      activeCount: activeSessions.length,
+      conflictingCount: conflictingSessions.length,
+      serverVersion,
+      sessionsNeedingAckCount: sessionsNeedingAck.length,
+      sessions: activeSessions,
+      conflicts: conflictingSessions
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 // ─── Files API (for image elements) ───────────────────────────
 // GET all files
-app.get('/api/files', (_req: Request, res: Response) => {
+app.get('/api/files', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
   const filesObj: Record<string, ExcalidrawFile> = {};
-  files.forEach((f, id) => { filesObj[id] = f; });
+  listFiles(diagramId).forEach((f) => { filesObj[f.id] = f; });
   res.json({ files: filesObj });
 });
 
 // POST add/update files (batch)
 app.post('/api/files', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
+  const sessionId = getSessionIdFromRequest(req);
   const body = req.body;
   const fileList: ExcalidrawFile[] = Array.isArray(body) ? body : (body?.files || []);
-  for (const f of fileList) {
-    if (f.id && f.dataURL) {
-      files.set(f.id, { id: f.id, dataURL: f.dataURL, mimeType: f.mimeType || 'image/png', created: f.created || Date.now() });
+  if (fileList.length > 0) {
+    const normalizedFiles = fileList
+      .filter(f => f.id && f.dataURL)
+      .map(f => ({ id: f.id, dataURL: f.dataURL, mimeType: f.mimeType || 'image/png', created: f.created || Date.now() }));
+    if (normalizedFiles.length > 0) {
+      upsertFiles(diagramId, normalizedFiles, sessionId);
+      if (sessionId) {
+        touchSession(sessionId, diagramId);
+      }
     }
   }
-  // Broadcast files to connected clients
-  broadcast({ type: 'files_added', files: fileList });
+  if (sessionId) {
+    broadcastToSession(sessionId, { type: 'files_added', files: fileList }, diagramId);
+  }
   res.json({ success: true, count: fileList.length });
 });
 
 // DELETE a file
 app.delete('/api/files/:id', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
+  const sessionId = getSessionIdFromRequest(req);
   const id = req.params.id as string;
-  if (files.delete(id)) {
-    broadcast({ type: 'file_deleted', fileId: id });
+  if (deleteFileRecord(diagramId, id)) {
+    if (sessionId) {
+      touchSession(sessionId, diagramId);
+    }
+    if (sessionId) {
+      broadcastToSession(sessionId, { type: 'file_deleted', fileId: id }, diagramId);
+    }
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, error: `File with ID ${id} not found` });
@@ -858,6 +1475,7 @@ const pendingExports = new Map<string, PendingExport>();
 
 app.post('/api/export/image', (req: Request, res: Response) => {
   try {
+    const diagramId = getDiagramIdFromRequest(req);
     const { format, background } = req.body;
 
     if (!format || !['png', 'svg'].includes(format)) {
@@ -867,7 +1485,8 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       });
     }
 
-    if (clients.size === 0) {
+    const diagramSet = diagramClients.get(diagramId);
+    if ((!diagramSet || diagramSet.size === 0) && clients.size === 0) {
       return res.status(503).json({
         success: false,
         error: 'No frontend client connected. Open the canvas in a browser first.'
@@ -880,7 +1499,6 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       const timeout = setTimeout(() => {
         const pending = pendingExports.get(requestId);
         pendingExports.delete(requestId);
-        // If we collected any result during the window, use it
         if (pending?.bestResult) {
           resolve(pending.bestResult);
         } else {
@@ -891,19 +1509,16 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       pendingExports.set(requestId, { resolve, reject, timeout, collectionTimeout: null, bestResult: null });
     });
 
-    // Re-broadcast current elements so all connected clients (including stale ones)
-    // sync to the canonical server state before exporting
     const filesObj: Record<string, ExcalidrawFile> = {};
-    files.forEach((f, id) => { filesObj[id] = f; });
-    broadcast({
+    listFiles(diagramId).forEach((f) => { filesObj[f.id] = f; });
+    broadcastToDiagram(diagramId, {
       type: 'initial_elements',
-      elements: Array.from(elements.values()),
-      ...(files.size > 0 ? { files: filesObj } : {})
+      elements: currentElements(diagramId),
+      ...(Object.keys(filesObj).length > 0 ? { files: filesObj } : {})
     } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
 
-    // Give browsers time to process the reload before requesting export
     setTimeout(() => {
-      broadcast({
+      broadcastToDiagram(diagramId, {
         type: 'export_image_request',
         requestId,
         format,
@@ -995,9 +1610,11 @@ const pendingViewports = new Map<string, PendingViewport>();
 
 app.post('/api/viewport', (req: Request, res: Response) => {
   try {
+    const diagramId = getDiagramIdFromRequest(req);
     const { scrollToContent, scrollToElementId, zoom, offsetX, offsetY } = req.body;
 
-    if (clients.size === 0) {
+    const diagramSet = diagramClients.get(diagramId);
+    if ((!diagramSet || diagramSet.size === 0) && clients.size === 0) {
       return res.status(503).json({
         success: false,
         error: 'No frontend client connected. Open the canvas in a browser first.'
@@ -1015,7 +1632,7 @@ app.post('/api/viewport', (req: Request, res: Response) => {
       pendingViewports.set(requestId, { resolve, reject, timeout });
     });
 
-    broadcast({
+    broadcastToDiagram(diagramId, {
       type: 'set_viewport',
       requestId,
       scrollToContent,
@@ -1094,13 +1711,15 @@ app.post('/api/snapshots', (req: Request, res: Response) => {
       });
     }
 
+    const diagramId = getDiagramIdFromRequest(req);
     const snapshot: Snapshot = {
       name,
-      elements: Array.from(elements.values()),
+      elements: currentElements(diagramId),
       createdAt: new Date().toISOString()
     };
 
-    snapshots.set(name, snapshot);
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : undefined;
+    saveSnapshotRecord(diagramId, snapshot, sessionId);
     logger.info(`Snapshot saved: "${name}" with ${snapshot.elements.length} elements`);
 
     res.json({
@@ -1121,10 +1740,12 @@ app.post('/api/snapshots', (req: Request, res: Response) => {
 // Snapshots: list
 app.get('/api/snapshots', (req: Request, res: Response) => {
   try {
-    const list = Array.from(snapshots.values()).map(s => ({
+    const diagramId = getDiagramIdFromRequest(req);
+    const list = Array.from(getSnapshotMap(diagramId).values()).map(s => ({
       name: s.name,
       elementCount: s.elements.length,
-      createdAt: s.createdAt
+      createdAt: s.createdAt,
+      isAutoBackup: s.name.startsWith('auto-')
     }));
 
     res.json({
@@ -1141,11 +1762,106 @@ app.get('/api/snapshots', (req: Request, res: Response) => {
   }
 });
 
+// Backups: list only automatic backups (auto-* snapshots)
+app.get('/api/backups', (req: Request, res: Response) => {
+  try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const allSnapshots = Array.from(getSnapshotMap(diagramId).values());
+    const backups = allSnapshots
+      .filter(s => s.name.startsWith('auto-'))
+      .map(s => {
+        // Parse backup reason from name: auto-{reason}-{timestamp}
+        const parts = s.name.split('-');
+        const reason = parts.length >= 3 ? parts[1] : 'unknown';
+        return {
+          name: s.name,
+          reason,
+          elementCount: s.elements.length,
+          createdAt: s.createdAt
+        };
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    res.json({
+      success: true,
+      backups,
+      count: backups.length
+    });
+  } catch (error) {
+    logger.error('Error listing backups:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
+// Backups: preview a specific backup (get elements without restoring)
+app.get('/api/backups/:name/preview', (req: Request, res: Response) => {
+  try {
+    const diagramId = getDiagramIdFromRequest(req);
+    const { name } = req.params;
+    const snapshot = getSnapshotByName(diagramId, name!);
+
+    if (!snapshot) {
+      return res.status(404).json({
+        success: false,
+        error: `Backup "${name}" not found`
+      });
+    }
+
+    if (!snapshot.name.startsWith('auto-')) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only automatic backups can be previewed'
+      });
+    }
+
+    // Return summary of elements in the backup for preview
+    const elementSummary = snapshot.elements.reduce<Record<string, number>>((acc, el) => {
+      acc[el.type] = (acc[el.type] || 0) + 1;
+      return acc;
+    }, {});
+
+    // Calculate bounding box
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const el of snapshot.elements) {
+      minX = Math.min(minX, el.x);
+      minY = Math.min(minY, el.y);
+      maxX = Math.max(maxX, el.x + (el.width || 0));
+      maxY = Math.max(maxY, el.y + (el.height || 0));
+    }
+
+    res.json({
+      success: true,
+      preview: {
+        name: snapshot.name,
+        elementCount: snapshot.elements.length,
+        elementSummary,
+        boundingBox: snapshot.elements.length > 0 ? {
+          x: Math.round(minX),
+          y: Math.round(minY),
+          width: Math.round(maxX - minX),
+          height: Math.round(maxY - minY)
+        } : null,
+        createdAt: snapshot.createdAt
+      }
+    });
+  } catch (error) {
+    logger.error('Error previewing backup:', error);
+    res.status(500).json({
+      success: false,
+      error: (error as Error).message
+    });
+  }
+});
+
 // Snapshots: get by name
 app.get('/api/snapshots/:name', (req: Request, res: Response) => {
   try {
+    const diagramId = getDiagramIdFromRequest(req);
     const { name } = req.params;
-    const snapshot = snapshots.get(name!);
+    const snapshot = getSnapshotByName(diagramId, name!);
 
     if (!snapshot) {
       return res.status(404).json({
@@ -1167,6 +1883,290 @@ app.get('/api/snapshots/:name', (req: Request, res: Response) => {
   }
 });
 
+// ─── Diagram management routes ────────────────────────────────
+
+// Internal endpoint: receives diagram updates from MCP server and broadcasts to WebSocket clients
+app.post('/api/internal/diagram-updated', (req: Request, res: Response) => {
+  try {
+    const { diagramId, diagramName, action } = req.body;
+    if (!diagramId || !diagramName) {
+      return res.status(400).json({ success: false, error: 'diagramId and diagramName required' });
+    }
+    // Broadcast to ALL connected clients (not just diagram-specific) so they refresh diagram list
+    const message = JSON.stringify({ type: 'diagram_updated', diagramId, diagramName, action: action || 'updated' });
+    diagramClients.forEach((clients, did) => {
+      clients.forEach(client => {
+        if (client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(message);
+        }
+      });
+    });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// List all diagrams
+app.get('/api/diagrams', (_req: Request, res: Response) => {
+  try {
+    const diagrams = diagramStore.listDiagrams();
+    res.json({ success: true, diagrams, count: diagrams.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Create a new diagram
+app.post('/api/diagrams', (req: Request, res: Response) => {
+  try {
+    const { name, tags, description, thumbnail } = req.body;
+    if (!name || typeof name !== 'string') {
+      return res.status(400).json({ success: false, error: 'name is required' });
+    }
+    const diagram = diagramStore.ensureDiagram({
+      id: generateId(),
+      name,
+      tags: Array.isArray(tags) ? tags : [],
+      description: description || null,
+      thumbnail: thumbnail || null,
+    });
+    res.json({ success: true, diagram });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Get a diagram by id
+app.get('/api/diagrams/:id', (req: Request, res: Response) => {
+  try {
+    const diagram = diagramStore.getDiagram(req.params.id!);
+    res.json({ success: true, diagram });
+  } catch (error) {
+    res.status(404).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Update diagram metadata
+app.patch('/api/diagrams/:id', (req: Request, res: Response) => {
+  try {
+    const id = req.params.id!;
+    const { name, tags, description, archivedAt, thumbnail } = req.body;
+    const updated = diagramStore.updateDiagram(id, { name, tags, description, archivedAt, thumbnail });
+    res.json({ success: true, diagram: updated });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.post('/api/diagrams/:id/duplicate', (req: Request, res: Response) => {
+  try {
+    const sourceId = req.params.id!;
+    const { name } = req.body;
+    const diagram = diagramStore.duplicateDiagram(sourceId, typeof name === 'string' ? name : undefined);
+    res.json({ success: true, diagram });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.delete('/api/diagrams/:id', (req: Request, res: Response) => {
+  try {
+    const id = req.params.id!;
+    diagramStore.closeSessionsForDiagram(id);
+    const deleted = diagramStore.deleteDiagram(id);
+    if (!deleted) {
+      return res.status(404).json({ success: false, error: `Diagram ${id} not found` });
+    }
+    res.json({ success: true, deleted: true, diagramId: id });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Get full diagram state (elements + files + snapshots + sessions)
+app.get('/api/diagrams/:id/state', (req: Request, res: Response) => {
+  try {
+    const state = diagramStore.getDiagramState(req.params.id!);
+    res.json({ success: true, ...state });
+  } catch (error) {
+    res.status(404).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// List sessions for a diagram
+app.get('/api/diagrams/:id/sessions', (req: Request, res: Response) => {
+  try {
+    const sessions = diagramStore.listSessions(req.params.id!);
+    res.json({ success: true, sessions, count: sessions.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// List sync events for a diagram
+app.get('/api/diagrams/:id/events', (req: Request, res: Response) => {
+  try {
+    const limit = parseInt(String(req.query.limit || '100'), 10);
+    const events = diagramStore.listEvents(req.params.id!, limit);
+    res.json({ success: true, events, count: events.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Restore a snapshot into a diagram
+app.post('/api/diagrams/:id/restore', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const { snapshotName, sessionId } = req.body;
+    if (!snapshotName) {
+      return res.status(400).json({ success: false, error: 'snapshotName is required' });
+    }
+
+    // Check operation lock for restore
+    const lock = diagramStore.getOperationLock('restore');
+    if (lock && lock.lockedBySessionId !== sessionId) {
+      logger.warn(`Restore operation blocked by lock held by session ${lock.lockedBySessionId}`);
+      return res.status(409).json({
+        success: false,
+        error: `Another session is currently restoring the diagram. Please try again later.`,
+        operationLock: {
+          lockedBySessionId: lock.lockedBySessionId,
+          lockedAt: lock.lockedAt,
+          expiresAt: lock.expiresAt,
+        }
+      });
+    }
+
+    // Acquire operation lock for restore duration
+    const lockAcquired = diagramStore.acquireOperationLock('restore', sessionId, 60000); // 60 second lock
+    if (!lockAcquired) {
+      return res.status(409).json({
+        success: false,
+        error: 'Could not acquire restore lock. Another restore may be in progress.'
+      });
+    }
+
+    try {
+      const backup = createAutomaticBackup(diagramId, 'restore', typeof sessionId === 'string' ? sessionId : undefined);
+      const snapshot = diagramStore.restoreSnapshot(diagramId, snapshotName, typeof sessionId === 'string' ? sessionId : undefined);
+      const filesObj = listDiagramFiles(diagramId);
+      broadcastToDiagram(diagramId, {
+        type: 'initial_elements',
+        elements: snapshot.elements,
+        ...(Object.keys(filesObj).length > 0 ? { files: filesObj } : {})
+      } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
+      res.json({ success: true, elementCount: snapshot.elements.length, restoredFrom: snapshotName, backupSnapshot: backup?.name ?? null });
+    } finally {
+      // Release the operation lock
+      diagramStore.releaseOperationLock('restore', sessionId);
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.post('/api/diagrams/:id/import', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const { elements, sessionId, mode = 'replace' } = req.body;
+    if (!Array.isArray(elements)) {
+      return res.status(400).json({ success: false, error: 'elements must be an array' });
+    }
+
+    // Schema hardening: validate import payload
+    const payloadValidation = validatePayloadSize(elements);
+    if (!payloadValidation.valid) {
+      return res.status(413).json({
+        success: false,
+        error: 'Payload too large',
+        details: payloadValidation.errors
+      });
+    }
+
+    const batchValidation = validateBatchOperation(elements);
+    if (!batchValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Import validation failed',
+        details: batchValidation.errors
+      });
+    }
+
+    let backupSnapshot: string | null = null;
+    if (mode === 'replace') {
+      backupSnapshot = createAutomaticBackup(diagramId, 'import', typeof sessionId === 'string' ? sessionId : undefined)?.name ?? null;
+      diagramStore.replaceElements(diagramId, elements, typeof sessionId === 'string' ? sessionId : undefined);
+    } else {
+      elements.forEach((element: ServerElement) => {
+        diagramStore.upsertElement(diagramId, element, typeof sessionId === 'string' ? sessionId : undefined);
+      });
+    }
+
+    const filesObj = listDiagramFiles(diagramId);
+    broadcastToDiagram(diagramId, {
+      type: 'initial_elements',
+      elements: currentElements(diagramId),
+      ...(Object.keys(filesObj).length > 0 ? { files: filesObj } : {})
+    } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
+
+    res.json({
+      success: true,
+      diagramId,
+      count: currentElementCount(diagramId),
+      mode,
+      backupSnapshot,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.get('/api/diagrams/:id/history', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const limit = parseInt(String(req.query.limit || '100'), 10);
+    const events = diagramStore.listEvents(diagramId, limit);
+    res.json({ success: true, diagramId, events, count: events.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Mutation history endpoint for undo/redo
+app.get('/api/diagrams/:id/mutation-history', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const limit = parseInt(String(req.query.limit || '50'), 10);
+    const history = diagramStore.getMutationHistory(diagramId, limit);
+    res.json({ success: true, diagramId, mutations: history, count: history.length });
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Undo last mutation
+app.post('/api/diagrams/:id/undo', (req: Request, res: Response) => {
+  try {
+    const diagramId = req.params.id!;
+    const result = diagramStore.undoLastMutation(diagramId);
+    if (result) {
+      const filesObj = listDiagramFiles(diagramId);
+      broadcastToDiagram(diagramId, {
+        type: 'initial_elements',
+        elements: currentElements(diagramId),
+        ...(Object.keys(filesObj).length > 0 ? { files: filesObj } : {})
+      } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
+      res.json({ success: true, message: 'Undo successful', undone: result });
+    } else {
+      res.json({ success: true, message: 'Nothing to undo', undone: null });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 // Serve the frontend
 app.get('/', (req: Request, res: Response) => {
   const htmlFile = path.join(__dirname, '../dist/frontend/index.html');
@@ -1180,25 +2180,64 @@ app.get('/', (req: Request, res: Response) => {
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
+  const metrics = getHealthMetrics(clients, diagramClients, () => currentElementCount(diagramId));
   res.json({
-    status: 'healthy',
+    status: metrics.status,
     timestamp: new Date().toISOString(),
-    elements_count: elements.size,
-    websocket_clients: clients.size
+    elements_count: metrics.elementCount,
+    websocket_clients: metrics.websocketClients,
+    active_sessions: metrics.activeSessions,
+    memory_usage_mb: metrics.memoryUsageMb,
+    uptime_seconds: metrics.uptimeSeconds,
+    issues: metrics.issues
   });
 });
 
-// Sync status endpoint
+// Sync status endpoint with metrics
 app.get('/api/sync/status', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
+  const metrics = getHealthMetrics(clients, diagramClients, () => currentElementCount(diagramId));
   res.json({
     success: true,
-    elementCount: elements.size,
+    elementCount: currentElementCount(diagramId),
     timestamp: new Date().toISOString(),
     memoryUsage: {
       heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024), // MB
       heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024), // MB
     },
-    websocketClients: clients.size
+    websocketClients: metrics.websocketClients,
+    health: metrics.status
+  });
+});
+
+// Observability metrics endpoints
+app.get('/api/metrics/sync', (req: Request, res: Response) => {
+  const limit = parseInt(String(req.query.limit || '100'), 10);
+  const metrics = getRecentSyncMetrics(limit);
+  res.json({
+    success: true,
+    count: metrics.length,
+    metrics
+  });
+});
+
+app.get('/api/metrics/performance', (req: Request, res: Response) => {
+  const limit = parseInt(String(req.query.limit || '100'), 10);
+  const metrics = getRecentPerformanceMetrics(limit);
+  res.json({
+    success: true,
+    count: metrics.length,
+    metrics
+  });
+});
+
+app.get('/api/metrics/health', (req: Request, res: Response) => {
+  const diagramId = getDiagramIdFromRequest(req);
+  const metrics = getHealthMetrics(clients, diagramClients, () => currentElementCount(diagramId));
+  res.json({
+    success: true,
+    ...metrics
   });
 });
 
