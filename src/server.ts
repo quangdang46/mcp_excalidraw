@@ -547,13 +547,12 @@ app.post('/api/elements', (req: Request, res: Response) => {
       touchSession(sessionId, diagramId);
     }
 
+    // Broadcast to all connected clients on this diagram
     const message: ElementCreatedMessage = {
       type: 'element_created',
       element: persistedElement
     };
-    if (sessionId) {
-      broadcastToSession(sessionId, message, diagramId);
-    }
+    broadcastToDiagram(diagramId, message, sessionId);
 
     res.json({
       success: true,
@@ -631,14 +630,12 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       touchSession(sessionId, diagramId);
     }
 
-    // Broadcast to all connected clients
+    // Broadcast to all connected clients on this diagram (exclude sender)
     const message: ElementUpdatedMessage = {
       type: 'element_updated',
       element: persistedElement
     };
-    if (sessionId) {
-      broadcastToSession(sessionId, message, diagramId);
-    }
+    broadcastToDiagram(diagramId, message, sessionId);
 
     res.json({
       success: true,
@@ -734,14 +731,12 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
     }
 
 
-    // Broadcast to all connected clients
+    // Broadcast to all connected clients on this diagram (exclude sender)
     const message: ElementDeletedMessage = {
       type: 'element_deleted',
       elementId: id!
     };
-    if (sessionId) {
-      broadcastToSession(sessionId, message, diagramId);
-    }
+    broadcastToDiagram(diagramId, message, sessionId);
 
     res.json({
       success: true,
@@ -1000,14 +995,12 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
       persistElements(diagramId, createdElements);
     }
 
-    // Broadcast to all connected clients
+    // Broadcast to all connected clients on this diagram (not just the calling session)
     const message: BatchCreatedMessage = {
       type: 'elements_batch_created',
       elements: createdElements
     };
-    if (sessionId) {
-      broadcastToSession(sessionId, message, diagramId);
-    }
+    broadcastToDiagram(diagramId, message);
 
     res.json({
       success: true,

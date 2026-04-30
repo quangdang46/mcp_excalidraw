@@ -291,8 +291,8 @@ function normalizePoints(points: Array<{ x: number; y: number } | [number, numbe
 const ElementSchema = z.object({
   id: z.string().optional(),
   type: z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
-  x: z.number(),
-  y: z.number(),
+  x: z.number().optional(), // Optional for bound arrows (positions computed from bindings)
+  y: z.number().optional(), // Optional for bound arrows (positions computed from bindings)
   width: z.number().optional(),
   height: z.number().optional(),
   points: z.array(PointSchema).optional(),
@@ -1200,9 +1200,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         const { startElementId, endElementId, id: customId, ...elementProps } = params;
         const id = customId || generateId();
+        // For bound arrows, x/y are optional and will be computed by resolveArrowBindings
+        // Set placeholder values if not provided
+        const x = elementProps.x ?? 0;
+        const y = elementProps.y ?? 0;
         const element: ServerElement = {
           id,
           ...elementProps,
+          x,
+          y,
           points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
           // Convert binding IDs to Excalidraw's start/end format
           ...(startElementId ? { start: { id: startElementId } } : {}),
@@ -1712,14 +1718,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         
         logger.info('Batch creating elements via MCP', { count: params.elements.length, diagram: currentDiagram.name });
 
-        const createdElements: ServerElement[] = [];
+        const createdElements: (ServerElement & { x: number; y: number })[] = [];
 
         for (const elementData of params.elements) {
           const { startElementId, endElementId, id: customId, ...elementProps } = elementData;
           const id = customId || generateId();
-          const element: ServerElement = {
+          // For bound arrows, x/y are optional and will be computed by resolveArrowBindings
+          // Set placeholder values if not provided
+          const x = elementProps.x ?? 0;
+          const y = elementProps.y ?? 0;
+          const element = {
             id,
             ...elementProps,
+            x,
+            y,
             points: elementProps.points ? normalizePoints(elementProps.points) : undefined,
             // Convert binding IDs to Excalidraw's start/end format
             ...(startElementId ? { start: { id: startElementId } } : {}),
@@ -1727,7 +1739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             version: 1
-          };
+          } as ServerElement & { x: number; y: number };
 
           // Normalize fontFamily from string names to numeric values
           if (element.fontFamily !== undefined) {
