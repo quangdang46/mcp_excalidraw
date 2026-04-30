@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
 import logger from './utils/logger.js';
@@ -22,7 +23,7 @@ import {
 } from './types.js';
 
 // Hardcode absolute path to ensure both MCP and Express servers use the same DB
-const DATA_DIR = '/data/projects/mcp_excalidraw/.excalidraw_mcp';
+const DATA_DIR = path.join(os.homedir(), '.excalidraw_mcp');
 const DB_PATH = process.env.EXCALIDRAW_DB_PATH || path.join(DATA_DIR, 'excalidraw.sqlite');
 
 function ensureDataDir(): void {
