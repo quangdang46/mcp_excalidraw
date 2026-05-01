@@ -34,7 +34,7 @@ Keywords: Excalidraw agent skill, Excalidraw MCP server, AI diagramming, Claude 
   - [OpenCode](#opencode)
   - [Antigravity (Google)](#antigravity-google)
 - [Agent Skill (Optional)](#agent-skill-optional)
-- [MCP Tools (26 Total)](#mcp-tools-26-total)
+- [MCP Tools (45 Total)](#mcp-tools-45-total)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Known Issues / TODO](#known-issues--todo)
@@ -53,9 +53,9 @@ Excalidraw now has an [official MCP](https://github.com/excalidraw/excalidraw-mc
 
 | | Official Excalidraw MCP | This Project |
 |---|---|---|
-| **Approach** | Prompt in, diagram out (one-shot) | Programmatic element-level control (26 tools) |
+| **Approach** | Prompt in, diagram out (one-shot) | Programmatic element-level control (45 tools) |
 | **State** | Stateless — each call is independent | Persistent live canvas with real-time sync |
-| **Element CRUD** | No | Full create / read / update / delete per element |
+| **Element CRUD** | No | Full create / read / update / delete per element with batch support |
 | **AI sees the canvas** | No | `describe_scene` (structured text) + `get_canvas_screenshot` (image) |
 | **Iterative refinement** | No — regenerate the whole diagram | Draw → look → adjust → look again, element by element |
 | **Layout tools** | No | `align_elements`, `distribute_elements`, `group / ungroup` |
@@ -75,7 +75,7 @@ Excalidraw now has an [official MCP](https://github.com/excalidraw/excalidraw-mc
 
 ### v2.0 — Canvas Toolkit
 
-- 13 new MCP tools (26 total): `get_element`, `clear_canvas`, `export_scene`, `import_scene`, `export_to_image`, `duplicate_elements`, `snapshot_scene`, `restore_snapshot`, `describe_scene`, `get_canvas_screenshot`, `read_diagram_guide`, `export_to_excalidraw_url`, `set_viewport`
+- 19 new MCP tools (45 total): `get_element`, `clear_canvas`, `export_scene`, `import_scene`, `export_to_image`, `duplicate_elements`, `snapshot_scene`, `restore_snapshot`, `describe_scene`, `get_canvas_screenshot`, `read_diagram_guide`, `export_to_excalidraw_url`, `set_viewport`
 - **Closed feedback loop**: AI can now inspect the canvas (`describe_scene`) and see it (`get_canvas_screenshot` returns an image) — enabling iterative refinement
 - **Design guide**: `read_diagram_guide` returns best-practice color palettes, sizing rules, layout patterns, and anti-patterns — dramatically improves AI-generated diagram quality
 - **Shareable URLs**: `export_to_excalidraw_url` encrypts and uploads the scene to excalidraw.com, returns a shareable link anyone can open
@@ -423,20 +423,101 @@ EXPRESS_SERVER_URL=http://127.0.0.1:3000 node skills/excalidraw-skill/scripts/im
 
 See `skills/excalidraw-skill/SKILL.md` and `skills/excalidraw-skill/references/cheatsheet.md`.
 
-## MCP Tools (26 Total)
+## MCP Tools (45 Total)
 
-| Category | Tools |
-|---|---|
-| **Element CRUD** | `create_element`, `get_element`, `update_element`, `delete_element`, `query_elements`, `batch_create_elements`, `duplicate_elements` |
-| **Layout** | `align_elements`, `distribute_elements`, `group_elements`, `ungroup_elements`, `lock_elements`, `unlock_elements` |
-| **Scene Awareness** | `describe_scene`, `get_canvas_screenshot` |
-| **File I/O** | `export_scene`, `import_scene`, `export_to_image`, `export_to_excalidraw_url`, `create_from_mermaid` |
-| **State Management** | `clear_canvas`, `snapshot_scene`, `restore_snapshot` |
-| **Viewport** | `set_viewport` |
-| **Design Guide** | `read_diagram_guide` |
-| **Resources** | `get_resource` |
+### Element Management (9 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `create_element` | Create a new element | `type`, `x`, `y`, `width`, `height`, `strokeColor`, `backgroundColor`, `text`, `fontSize`, `fontFamily`, `startElementId`, `endElementId`, `endArrowhead`, `startArrowhead`, `roughness`, `opacity`, `strokeStyle`, `strokeWidth` |
+| `update_element` | Update existing element | `id` (required), all element properties |
+| `delete_element` | Delete element | `id` (required) |
+| `get_element` | Get single element by ID | `id` (required) |
+| `query_elements` | Query with filters | `type`, `filter`, `bbox` (x_min/x_max/y_min/y_max) |
+| `batch_create_elements` | Create multiple elements | `elements` array, use `startElementId`/`endElementId` for arrows |
+| `duplicate_elements` | Duplicate elements | `elementIds`, `offsetX` (default 20), `offsetY` (default 20) |
+| `group_elements` | Group elements together | `elementIds` |
+| `ungroup_elements` | Ungroup a group | `groupId` |
 
-Full schemas are discoverable via `tools/list` or in `skills/excalidraw-skill/references/cheatsheet.md`.
+### Alignment & Layout (4 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `align_elements` | Align elements | `elementIds`, `alignment` (left/center/right/top/middle/bottom) |
+| `distribute_elements` | Distribute evenly | `elementIds`, `direction` (horizontal/vertical) |
+| `lock_elements` | Lock elements | `elementIds` |
+| `unlock_elements` | Unlock elements | `elementIds` |
+
+### Diagram Management (14 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `create_diagram` | Create new named diagram | `name` (required), `tags`, `description` |
+| `get_diagram` | Get diagram metadata | `diagramId` |
+| `update_diagram` | Update diagram metadata | `diagramId`, `name`, `tags`, `description`, `archived` |
+| `get_diagram_state` | Get full state (elements, files, snapshots, sessions) | `diagramId` |
+| `get_active_diagram` | Get active diagram info | - |
+| `load_diagram` | Load diagram into session | `diagramId` |
+| `set_active_diagram` | Switch active diagram | `diagramId` |
+| `duplicate_diagram` | Duplicate diagram | `diagramId`, `name` |
+| `delete_diagram` | Delete diagram permanently | `diagramId` |
+| `list_diagrams` | List all diagrams | - |
+| `list_recent_diagrams` | List recently updated | `limit` |
+| `search_diagrams` | Search by name/description/tags | `query`, `tags` |
+| `archive_diagram` | Soft delete | `diagramId` |
+| `unarchive_diagram` | Restore archived | `diagramId` |
+
+### Import/Export (6 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `export_scene` | Export to .excalidraw JSON | `filePath` |
+| `import_scene` | Import from .excalidraw JSON | `filePath` or `data`, `mode` (replace/merge) |
+| `export_to_image` | Export PNG/SVG | `format` (png/svg), `filePath`, `background`, `diagramId` |
+| `export_diagram` | Export full diagram state | `diagramId` |
+| `import_diagram` | Import diagram state | `data`, `targetId` |
+| `export_to_excalidraw_url` | Shareable excalidraw.com URL | - |
+
+### Canvas Operations (3 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `clear_canvas` | Clear all elements | - |
+| `get_canvas_screenshot` | Take screenshot (requires browser open) | `background`, `diagramId` |
+| `set_viewport` | Control camera | `scrollToContent`, `scrollToElementId`, `zoom`, `offsetX`, `offsetY`, `diagramId` |
+
+### Snapshots (2 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `snapshot_scene` | Save named snapshot | `name`, `diagramId` |
+| `restore_snapshot` | Restore from snapshot | `name`, `diagramId` |
+
+### Scene Information (3 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `describe_scene` | AI-readable description | `diagramId` |
+| `read_diagram_guide` | Design best practices | - |
+| `list_diagram_events` | History of changes | `diagramId`, `limit` |
+
+### Resources & Information (2 tools)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `get_resource` | Get Excalidraw resource | `resource` (scene/library/theme/elements) |
+| `server_info` | Server version & status | - |
+
+### Mermaid Conversion (1 tool)
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `create_from_mermaid` | Convert Mermaid to Excalidraw | `mermaidDiagram`, `config` (startOnLoad, flowchart.curve, themeVariables.fontSize, maxEdges, maxTextSize) |
+
+### Element Types
+`rectangle`, `ellipse`, `diamond`, `arrow`, `text`, `line`, `freedraw`, `image`
+
+### Font Families
+| ID | Font |
+|----|------|
+| 1 | Virgil / Hand / Handwritten |
+| 2 | Helvetica / Sans / Sans-serif |
+| 3 | Cascadia / Mono / Monospace |
+| 5 | Excalifont |
+| 6 | Nunito |
+| 7 | Lilita One |
+| 8 | Comic Shanns |
 
 ## Testing
 
