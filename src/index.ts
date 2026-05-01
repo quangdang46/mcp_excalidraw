@@ -1235,18 +1235,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Convert text to label format for Excalidraw
         const excalidrawElement = convertTextToLabel(element);
 
-        // Create element directly on HTTP server (no local storage)
         const canvasElement = await createElementOnCanvas(excalidrawElement);
-        logger.info('Element created via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
+
+        const persistedElement = diagramStore.upsertElementWithSession(
+          activeContext.diagramId,
+          excalidrawElement,
+          activeContext.sessionId
+        );
+
+        logger.info('Element created via MCP', {
+          id: excalidrawElement.id,
           type: excalidrawElement.type,
-          synced: !!canvasElement 
+          synced: !!canvasElement,
+          persisted: !!persistedElement
         });
-        
+
         return {
-          content: [{ 
-            type: 'text', 
-            text: `Element created successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+          content: [{
+            type: 'text',
+            text: `Element created successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Persisted to SQLite`
           }]
         };
       }
@@ -1273,44 +1280,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         // Convert text to label format for Excalidraw
         const excalidrawElement = convertTextToLabel(updatePayload as ServerElement);
         
-        // Update element directly on HTTP server (no local storage)
         const canvasElement = await updateElementOnCanvas(excalidrawElement);
-        
+
         if (!canvasElement) {
           throw new Error('Failed to update element: HTTP server unavailable or element not found');
         }
-        
-        logger.info('Element updated via MCP and synced to canvas', { 
-          id: excalidrawElement.id, 
-          synced: !!canvasElement 
+
+        diagramStore.upsertElementWithSession(
+          activeContext.diagramId,
+          canvasElement,
+          activeContext.sessionId
+        );
+
+        logger.info('Element updated via MCP', {
+          id: excalidrawElement.id,
+          synced: !!canvasElement
         });
-        
+
         return {
-          content: [{ 
-            type: 'text', 
-            text: `Element updated successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas` 
+          content: [{
+            type: 'text',
+            text: `Element updated successfully!\n\n${JSON.stringify(canvasElement, null, 2)}\n\n✅ Synced to canvas and SQLite`
           }]
         };
       }
-      
+
       case 'delete_element': {
         const params = ElementIdSchema.parse(args);
         const { id } = params;
 
-        // Delete element directly on HTTP server (no local storage)
         const canvasResult = await deleteElementOnCanvas(id);
 
         if (!canvasResult || !(canvasResult as ApiResponse).success) {
           throw new Error('Failed to delete element: HTTP server unavailable or element not found');
         }
 
+        diagramStore.deleteElementWithSession(activeContext.diagramId, id, activeContext.sessionId);
+
         const result = { id, deleted: true, syncedToCanvas: true };
-        logger.info('Element deleted via MCP and synced to canvas', result);
+        logger.info('Element deleted via MCP', result);
 
         return {
           content: [{
             type: 'text',
-            text: `Element deleted successfully!\n\n${JSON.stringify(result, null, 2)}\n\n✅ Synced to canvas`
+            text: `Element deleted successfully!\n\n${JSON.stringify(result, null, 2)}\n\n✅ Synced to canvas and SQLite`
           }]
         };
       }
@@ -1760,6 +1773,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error('Failed to batch create elements: HTTP server unavailable');
         }
 
+        for (const el of createdElements) {
+          diagramStore.upsertElementWithSession(activeContext.diagramId, el, activeContext.sessionId);
+        }
+
         const result = {
           success: true,
           elements: canvasElements,
@@ -1807,12 +1824,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
           throw new Error(`Failed to clear canvas: ${response.status} ${response.statusText}`);
         }
 
+        diagramStore.clearDiagramWithSession(activeContext.diagramId, activeContext.sessionId);
+
         const data = await response.json() as ApiResponse;
 
         return {
           content: [{
             type: 'text',
-            text: `Canvas cleared.\n\n${JSON.stringify(data, null, 2)}`
+            text: `Canvas cleared.\n\n${JSON.stringify(data, null, 2)}\n\n✅ Synced to canvas and SQLite`
           }]
         };
       }
@@ -2333,10 +2352,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         const canvasElements = await batchCreateElementsOnCanvas(duplicates);
 
+        for (const el of duplicates) {
+          diagramStore.upsertElementWithSession(activeContext.diagramId, el, activeContext.sessionId);
+        }
+
         return {
           content: [{
             type: 'text',
-            text: `Duplicated ${duplicates.length} elements (offset: ${offsetX}, ${offsetY})\n\n${JSON.stringify(canvasElements, null, 2)}\n\n✅ Synced to canvas`
+            text: `Duplicated ${duplicates.length} elements (offset: ${offsetX}, ${offsetY})\n\n${JSON.stringify(canvasElements, null, 2)}\n\n✅ Synced to canvas and SQLite`
           }]
         };
       }
