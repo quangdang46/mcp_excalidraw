@@ -147,9 +147,12 @@ async function syncToCanvas(operation: string, data: any): Promise<SyncResponse 
 }
 
 // Helper to sync element creation to canvas
-async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement | null> {
+async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement> {
   const result = await syncToCanvas('create', elementData);
-  return result?.element || elementData;
+  if (!result) {
+    throw new Error('Canvas sync failed');
+  }
+  return result.element || elementData;
 }
 
 // Helper to sync element update to canvas  
@@ -1234,11 +1237,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         // Create element directly on HTTP server (no local storage)
         const canvasElement = await createElementOnCanvas(excalidrawElement);
-        
-        if (!canvasElement) {
-          throw new Error('Failed to create element: HTTP server unavailable');
-        }
-        
         logger.info('Element created via MCP and synced to canvas', { 
           id: excalidrawElement.id, 
           type: excalidrawElement.type,
